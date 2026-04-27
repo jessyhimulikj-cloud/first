@@ -18,7 +18,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 REQUIRED_MARKET_COLUMNS = ["ts_code", "name", "close", "pct_chg", "vol_ratio", "turnover_rate"]
 REQUIRED_FLOW_COLUMNS = ["ts_code", "main_net_inflow", "super_net_inflow", "main_inflow_ratio"]
@@ -207,10 +206,46 @@ def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float 
     return picked
 
 
-def _http_get_json(url: str, timeout: int = 12) -> dict:
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
-    with urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def _build_session() -> Any:
+    """创建请求会话：禁用系统代理，统一浏览器头。"""
+    requests = importlib.import_module("requests")
+    session = requests.Session()
+    session.trust_env = False  # 禁用系统代理，解决代理污染问题
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+    )
+    return session
+
+
+def _http_get_json(url: str, timeout: int = 12, max_retries: int = 3) -> dict:
+    """
+    使用 requests.Session 拉取 JSON。
+    - 禁用系统代理
+    - 最多重试 3 次
+    - 返回 502 或请求失败自动重试
+    """
+    requests = importlib.import_module("requests")
+    session = _build_session()
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = session.get(url, timeout=timeout)
+            if response.status_code == 502:
+                raise requests.HTTPError("502 Bad Gateway", response=response)
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, json.JSONDecodeError) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(0.8 * attempt)
+                continue
+            break
+
+    raise RuntimeError(f"HTTP 请求失败，重试{max_retries}次仍失败: {url}") from last_exc
 
 
 def _fetch_eastmoney_market(page_size: int = 200) -> List[Dict[str, str]]:
