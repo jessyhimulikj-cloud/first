@@ -169,7 +169,9 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
 
         closes = [_to_float(r.get("close", 0)) for r in rows[: idx + 1]]
         closes = [c for c in closes if c > 0]
-        if len(closes) < 6:
+        vols = [_to_float(r.get("amount", 0)) for r in rows[: idx + 1]]
+        pcts = [_to_float(r.get("pct_chg", 0)) for r in rows[: idx + 1]]
+        if len(closes) < 11 or len(vols) < 6 or len(pcts) < 3:
             continue
 
         name = name_map.get(symbol, symbol)
@@ -181,7 +183,26 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
         try:
             m3 = momentum(closes, 3)
             m5 = momentum(closes, 5)
+            m10 = momentum(closes, 10)
         except Exception:
+            continue
+
+        ma5 = sum(closes[-5:]) / 5.0
+        ma10 = sum(closes[-10:]) / 10.0
+        if not (close > ma5 > ma10):
+            continue
+        if m5 < 0 or m5 > 20:
+            continue
+        if m10 > 35:
+            continue
+        if any(p <= -9.5 for p in pcts[-3:]):
+            continue
+
+        avg_vol5 = sum(vols[-5:]) / 5.0
+        if avg_vol5 <= 0:
+            continue
+        volume_ratio = amount / avg_vol5
+        if volume_ratio <= 1.2:
             continue
 
         candidates.append(
@@ -192,6 +213,11 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
                 "amount": amount,
                 "momentum_3": m3,
                 "momentum_5": m5,
+                "ret_5": m5,
+                "ret_10": m10,
+                "ma5": ma5,
+                "ma10": ma10,
+                "volume_ratio": volume_ratio,
             }
         )
 
@@ -236,8 +262,8 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
         return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
 
     # take_profit_stop_loss
-    tp = buy_price * 1.06
-    sl = buy_price * 0.97
+    tp = buy_price * 1.05
+    sl = buy_price * 0.975
     last_idx = min(len(rows) - 1, buy_idx + 4)
 
     for i in range(buy_idx, last_idx + 1):

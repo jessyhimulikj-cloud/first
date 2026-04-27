@@ -68,7 +68,7 @@ def test_is_excluded_stock():
     assert _is_excluded_stock("000001", "正常", 2.8, 2e8, 1)[0] is True
     assert _is_excluded_stock("000001", "正常", 10, 9e7, 1)[0] is True
     assert _is_excluded_stock("000001", "正常", 10, 2e8, -6)[0] is True
-    assert _is_excluded_stock("000001", "正常", 10, 2e8, 10)[0] is True
+    assert _is_excluded_stock("000001", "正常", 10, 2e8, 8)[0] is True
 
 
 def test_calc_momentum():
@@ -88,6 +88,10 @@ def test_fetch_akshare_short_term(monkeypatch):
     assert "total_score" in rows[0]
     assert "momentum_3" in rows[0]
     assert "momentum_5" in rows[0]
+    assert "ret_5" in rows[0]
+    assert "ret_10" in rows[0]
+    assert "ma5" in rows[0]
+    assert "ma10" in rows[0]
     assert "volume_ratio" in rows[0]
     assert rows[0]["trend_flag"] == "uptrend_confirmed"
 

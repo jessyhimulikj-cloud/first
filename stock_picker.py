@@ -118,8 +118,8 @@ def _is_excluded_stock(code: str, name: str, close: float, amount: float, pct_ch
         return True, "low_amount"
     if pct_chg < -5:
         return True, "drop_too_much"
-    if pct_chg > 9.5:
-        return True, "chase_limit_up"
+    if pct_chg > 7:
+        return True, "chase_too_fast"
     return False, "normal"
 
 
@@ -212,13 +212,18 @@ def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float 
 
             ma5 = sum(closes[-5:]) / 5.0
             ma10 = sum(closes[-10:]) / 10.0
-            trend_ok = ma5 > ma10 and closes[-1] > ma5
+            trend_ok = closes[-1] > ma5 > ma10
             if not trend_ok:
                 continue
 
             momentum_3 = _calc_momentum(closes, 3)
             momentum_5 = _calc_momentum(closes, 5)
+            ret_10 = _calc_momentum(closes, 10)
             if momentum_5 < 0:
+                continue
+            if momentum_5 > 20:
+                continue
+            if ret_10 > 35:
                 continue
             if any(p <= -9.5 for p in pct_list[-3:]):
                 continue
@@ -227,7 +232,7 @@ def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float 
             if avg_vol_5 <= 0:
                 continue
             volume_ratio = vols[-1] / avg_vol_5
-            if volume_ratio <= 1.5:
+            if volume_ratio <= 1.2:
                 continue
 
             picked.append(
@@ -239,6 +244,10 @@ def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float 
                     "amount": c["amount"],
                     "momentum_3": momentum_3,
                     "momentum_5": momentum_5,
+                    "ret_5": momentum_5,
+                    "ret_10": ret_10,
+                    "ma5": ma5,
+                    "ma10": ma10,
                     "volume_ratio": volume_ratio,
                     "trend_flag": "uptrend_confirmed",
                     "risk_flag": "normal",
@@ -518,6 +527,10 @@ def write_output(rows: List[Dict[str, float | str]], path: Path, topn: int, sour
             "amount",
             "momentum_3",
             "momentum_5",
+            "ret_5",
+            "ret_10",
+            "ma5",
+            "ma10",
             "volume_ratio",
             "trend_flag",
             "total_score",

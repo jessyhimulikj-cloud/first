@@ -89,14 +89,14 @@ python stock_picker.py \
 
 新增短线增强规则：
 - 趋势确认（必须满足）：`5日线 > 10日线` 且 `收盘价 > 5日线`
-- 放量确认：`今日成交量 > 5日均量 * 1.5`
-- 剔除弱势：最近 5 天涨幅 < 0 剔除；最近 3 天有跌停（近似 <= -9.5%）剔除
+- 放量确认：`今日成交量 > 5日均量 * 1.2`
+- 剔除弱势：最近 5 天涨幅 < 0 剔除；最近 5 天涨幅 > 20% 剔除；最近 10 天涨幅 > 35% 剔除；最近 3 天有跌停（近似 <= -9.5%）剔除
 - 热点强化：仅保留当前涨幅排名前 20% 板块成分股
 
 `total_score = momentum_5 * 0.30 + momentum_3 * 0.20 + liquidity_z * 0.30 + pct_chg * 0.20`
 
 ### 输出字段
-- `ts_code, name, close, pct_chg, amount, momentum_3, momentum_5, volume_ratio, trend_flag, total_score, risk_flag`
+- `ts_code, name, close, pct_chg, amount, momentum_3, momentum_5, ret_5, ret_10, ma5, ma10, volume_ratio, trend_flag, total_score, risk_flag`
 
 ---
 
@@ -125,7 +125,7 @@ python backtest.py --months 3 --universe-size 50 --max-days 60 --output backtest
 - 三种卖出策略：
   - `hold_3`：持有 3 天
   - `hold_5`：持有 5 天
-  - `take_profit_stop_loss`：止盈 +6%，止损 -3%（最多观察 5 天）
+  - `take_profit_stop_loss`：止盈 +5%，止损 -2.5%（最多观察 5 天）
   - 默认仅启用 `hold_3`（可用 `--modes` 扩展）
 
 ### 输出指标
