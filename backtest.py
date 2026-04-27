@@ -154,6 +154,7 @@ def momentum(closes: List[float], days: int) -> float:
 
 def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]], name_map: Dict[str, str]) -> str | None:
     candidates: List[Dict[str, Any]] = []
+    relaxed_candidates: List[Dict[str, Any]] = []
 
     for symbol, rows in universe_data.items():
         idx = next((i for i, r in enumerate(rows) if r["date"] == day), -1)
@@ -191,47 +192,37 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
         ma10 = sum(closes[-10:]) / 10.0
         if not (close > ma5 > ma10):
             continue
-        if m5 < 0 or m5 > 20:
-            continue
-        if m10 > 35:
-            continue
         if any(p <= -9.5 for p in pcts[-3:]):
-            continue
-        if sum(1 for p in pcts[-3:] if p < 0) >= 2:
             continue
 
         high_20 = max(closes[-20:])
-        if high_20 > 0 and (high_20 - close) / high_20 < 0.05:
-            continue
-
-        recent5 = closes[-5:]
-        max_draw_5 = (max(recent5) - min(recent5)) / max(recent5) if max(recent5) > 0 else 0
-        if max_draw_5 > 0.08:
+        if high_20 > 0 and (high_20 - close) / high_20 < 0.03:
             continue
 
         avg_vol5 = sum(vols[-5:]) / 5.0
         if avg_vol5 <= 0:
             continue
         volume_ratio = amount / avg_vol5
-        if volume_ratio <= 1.2:
-            continue
 
-        candidates.append(
-            {
-                "symbol": symbol,
-                "close": close,
-                "pct_chg": pct_chg,
-                "amount": amount,
-                "momentum_3": m3,
-                "momentum_5": m5,
-                "ret_5": m5,
-                "ret_10": m10,
-                "ma5": ma5,
-                "ma10": ma10,
-                "volume_ratio": volume_ratio,
-            }
-        )
+        row = {
+            "symbol": symbol,
+            "close": close,
+            "pct_chg": pct_chg,
+            "amount": amount,
+            "momentum_3": m3,
+            "momentum_5": m5,
+            "ret_5": m5,
+            "ret_10": m10,
+            "ma5": ma5,
+            "ma10": ma10,
+            "volume_ratio": volume_ratio,
+        }
+        relaxed_candidates.append(row)
+        if (close > ma5 > ma10) and (volume_ratio > 1.2):
+            candidates.append(row)
 
+    if not candidates and relaxed_candidates:
+        candidates = relaxed_candidates
     if not candidates:
         return None
 
@@ -261,7 +252,7 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
         sell_price = _to_float(rows[sell_idx].get("close", 0))
         if sell_price <= 0:
             return None
-        return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, (sell_price / buy_price - 1) * 0.5, mode)
+        return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
 
     if mode == "hold_5":
         sell_idx = buy_idx + 4
@@ -270,10 +261,10 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
         sell_price = _to_float(rows[sell_idx].get("close", 0))
         if sell_price <= 0:
             return None
-        return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, (sell_price / buy_price - 1) * 0.5, mode)
+        return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
 
     # take_profit_stop_loss
-    tp = buy_price * 1.04
+    tp = buy_price * 1.06
     sl = buy_price * 0.98
     last_idx = min(len(rows) - 1, buy_idx + 4)
 
@@ -282,14 +273,14 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
         low = _to_float(day.get("low", 0))
         high = _to_float(day.get("high", 0))
         if low > 0 and low <= sl:
-            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, sl, (sl / buy_price - 1) * 0.5, mode)
+            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, sl, sl / buy_price - 1, mode)
         if high > 0 and high >= tp:
-            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, tp, (tp / buy_price - 1) * 0.5, mode)
+            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, tp, tp / buy_price - 1, mode)
 
     sell_price = _to_float(rows[last_idx].get("close", 0))
     if sell_price <= 0:
         return None
-    return TradeRecord(symbol, rows[buy_idx]["date"], rows[last_idx]["date"], buy_price, sell_price, (sell_price / buy_price - 1) * 0.5, mode)
+    return TradeRecord(symbol, rows[buy_idx]["date"], rows[last_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
 
 
 def max_drawdown(returns: List[float]) -> float:

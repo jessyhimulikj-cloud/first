@@ -200,6 +200,7 @@ def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float 
     candidates = candidates[: args.ak_hist_limit]
 
     picked: List[Dict[str, float | str]] = []
+    relaxed: List[Dict[str, float | str]] = []
     for c in candidates:
         try:
             hist_df = ak.stock_zh_a_hist(symbol=str(c["code"]), period="daily", adjust="qfq")
@@ -212,64 +213,49 @@ def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float 
 
             ma5 = sum(closes[-5:]) / 5.0
             ma10 = sum(closes[-10:]) / 10.0
-            trend_ok = closes[-1] > ma5 > ma10
-            if not trend_ok:
-                continue
-
             momentum_3 = _calc_momentum(closes, 3)
             momentum_5 = _calc_momentum(closes, 5)
             ret_10 = _calc_momentum(closes, 10)
-            if momentum_5 < 0:
-                continue
-            if momentum_5 > 20:
-                continue
-            if ret_10 > 35:
-                continue
             if any(p <= -9.5 for p in pct_list[-3:]):
                 continue
-            # 连续下跌过滤：最近3天里至少2天下跌
-            if sum(1 for p in pct_list[-3:] if p < 0) >= 2:
-                continue
 
-            # 高位风险过滤：距离20日最高价太近（<5%）则剔除，避免追高
+            # 高位风险过滤：距离20日最高价太近（<3%）则剔除，避免追高
             high_20 = max(closes[-20:])
-            if high_20 > 0 and (high_20 - closes[-1]) / high_20 < 0.05:
-                continue
-
-            # 最近5日最大跌幅（简化为区间高低回撤）
-            recent5 = closes[-5:]
-            max_draw_5 = (max(recent5) - min(recent5)) / max(recent5) if max(recent5) > 0 else 0
-            if max_draw_5 > 0.08:
+            if high_20 > 0 and (high_20 - closes[-1]) / high_20 < 0.03:
                 continue
 
             avg_vol_5 = sum(vols[-5:]) / 5.0 if sum(vols[-5:]) > 0 else 0.0
             if avg_vol_5 <= 0:
                 continue
             volume_ratio = vols[-1] / avg_vol_5
-            if volume_ratio <= 1.2:
-                continue
+            trend_ok = closes[-1] > ma5 > ma10
+            vol_ok = volume_ratio > 1.2
 
-            picked.append(
-                {
-                    "ts_code": c["ts_code"],
-                    "name": c["name"],
-                    "close": c["close"],
-                    "pct_chg": c["pct_chg"],
-                    "amount": c["amount"],
-                    "momentum_3": momentum_3,
-                    "momentum_5": momentum_5,
-                    "ret_5": momentum_5,
-                    "ret_10": ret_10,
-                    "ma5": ma5,
-                    "ma10": ma10,
-                    "drawdown_5": max_draw_5,
-                    "volume_ratio": volume_ratio,
-                    "trend_flag": "uptrend_confirmed",
-                    "risk_flag": "normal",
-                }
-            )
+            row = {
+                "ts_code": c["ts_code"],
+                "name": c["name"],
+                "close": c["close"],
+                "pct_chg": c["pct_chg"],
+                "amount": c["amount"],
+                "momentum_3": momentum_3,
+                "momentum_5": momentum_5,
+                "ret_5": momentum_5,
+                "ret_10": ret_10,
+                "ma5": ma5,
+                "ma10": ma10,
+                "volume_ratio": volume_ratio,
+                "trend_flag": "uptrend_confirmed" if trend_ok else "relaxed_entry",
+                "risk_flag": "normal",
+            }
+            relaxed.append(row)
+            if trend_ok and vol_ok:
+                picked.append(row)
         except Exception:
             continue
+
+    # 若严格条件无候选，则启用放宽池以恢复交易频率
+    if not picked:
+        picked = relaxed
 
     liquidity_z = robust_zscores([float(r["amount"]) for r in picked])
     for idx, r in enumerate(picked):
