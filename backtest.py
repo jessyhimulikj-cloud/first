@@ -233,7 +233,12 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
     return top3[0]["symbol"] if top3 else None
 
 
-def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) -> TradeRecord | None:
+def _apply_cost(raw_ret: float, fee_rate: float, slippage: float) -> float:
+    """交易成本：手续费(总) + 双边滑点。"""
+    return raw_ret - (fee_rate + 2 * slippage)
+
+
+def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, fee_rate: float, slippage: float) -> TradeRecord | None:
     buy_idx = day_idx + 1
     if buy_idx >= len(rows):
         return None
@@ -242,12 +247,13 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
     next_open = _to_float(rows[buy_idx].get("open", 0))
     if signal_close <= 0 or next_open <= 0:
         return None
+    # 严格使用 T 日收盘选股、T+1 开盘买入
     open_gap_pct = (next_open / signal_close - 1.0) * 100
     if open_gap_pct >= 2:
         return None
 
-    ma5_signal = sum(_to_float(r.get("close", 0)) for r in rows[max(0, day_idx - 4) : day_idx + 1]) / 5.0
-    buy_price = (next_open + ma5_signal) / 2.0
+    # 买入价修正为 next_day_open，避免回测偏差
+    buy_price = next_open
     if buy_price <= 0:
         return None
 
@@ -261,14 +267,17 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
         low = _to_float(day.get("low", 0))
         high = _to_float(day.get("high", 0))
         if low > 0 and low <= sl:
-            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, sl, sl / buy_price - 1, mode)
+            ret = _apply_cost(sl / buy_price - 1, fee_rate, slippage)
+            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, sl, ret, mode)
         if high > 0 and high >= tp:
-            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, tp, tp / buy_price - 1, mode)
+            ret = _apply_cost(tp / buy_price - 1, fee_rate, slippage)
+            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, tp, ret, mode)
 
     sell_price = _to_float(rows[last_idx].get("close", 0))
     if sell_price <= 0:
         return None
-    return TradeRecord(symbol, rows[buy_idx]["date"], rows[last_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
+    ret = _apply_cost(sell_price / buy_price - 1, fee_rate, slippage)
+    return TradeRecord(symbol, rows[buy_idx]["date"], rows[last_idx]["date"], buy_price, sell_price, ret, mode)
 
 
 def max_drawdown(returns: List[float]) -> float:
@@ -341,6 +350,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--universe-size", type=int, default=50, help="股票池数量，默认50")
     parser.add_argument("--max-days", type=int, default=60, help="最多回测交易日数量，默认60")
     parser.add_argument("--modes", nargs="+", default=["hold_3"], choices=["hold_3", "hold_5", "take_profit_stop_loss"], help="卖出模式")
+    parser.add_argument("--fee-rate", type=float, default=0.003, help="总手续费比例，默认0.3%")
+    parser.add_argument("--slippage", type=float, default=0.001, help="单边滑点比例，默认0.1%")
     parser.add_argument("--limit-300", action="store_true", help="限制为沪深300成分股，提升速度")
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache_backtest"))
     parser.add_argument("--output", type=Path, default=Path("backtest_result.csv"))
@@ -405,7 +416,7 @@ def main() -> None:
 
         for mode in modes:
             try:
-                tr = run_trade(symbol, day_idx, rows, mode)
+                tr = run_trade(symbol, day_idx, rows, mode, args.fee_rate, args.slippage)
                 if tr:
                     mode_trades[mode].append(tr)
             except Exception:

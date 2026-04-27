@@ -24,7 +24,7 @@ def test_run_trade_accepts_string_numeric_fields():
         {"date": "20240103", "open": "10.2", "high": "10.6", "low": "10.0", "close": "10.5", "amount": "130000000", "pct_chg": "2.0"},
         {"date": "20240104", "open": "10.5", "high": "10.8", "low": "10.4", "close": "10.7", "amount": "150000000", "pct_chg": "1.9"},
     ]
-    tr = run_trade("000001", 0, rows, "hold_3")
+    tr = run_trade("000001", 0, rows, "hold_3", 0.003, 0.001)
     assert tr is not None
     assert tr.sell_price > 0
 
@@ -36,3 +36,5 @@ def test_parse_args_defaults(monkeypatch):
     assert args.universe_size == 50
     assert args.max_days == 60
     assert args.modes == ["hold_3"]
+    assert args.fee_rate == 0.003
+    assert args.slippage == 0.001
