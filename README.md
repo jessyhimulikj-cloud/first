@@ -141,3 +141,31 @@ python backtest.py --source akshare --years 3 --limit-300 --output backtest_resu
 - 带进度打印（加载数据、回测进度）
 - 带异常处理（单标的失败自动跳过）
 - 带数据缓存（默认 `.cache_backtest/`，避免重复请求）
+
+---
+
+## 6. 每日自动选股（新增 daily_runner.py）
+
+功能：
+- 每天 `15:10` 自动执行
+- 调用 `stock_picker.py --source eastmoney`
+- 输出 `picked_stocks_日期.csv`
+- 累计写入 `history.csv`
+- 当天已执行过则自动跳过
+
+### 启动命令（常驻）
+
+```bash
+python daily_runner.py --time 15:10 --top 3 --output-dir . --history history.csv
+```
+
+### 立即执行一次（调试）
+
+```bash
+python daily_runner.py --once --top 3 --output-dir . --history history.csv
+```
+
+执行后会打印：
+- 今日推荐股票
+- 分数
+- 买入建议（开盘价附近分批买入）
