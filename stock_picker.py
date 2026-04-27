@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """自动选股系统（资金流 + 热点）
 
-支持两种数据源：
+支持三种数据源：
 1) csv：从本地 CSV 读取
-2) eastmoney：从东方财富接口拉取行情和资金流，题材数据可选 CSV
+2) eastmoney：从东方财富接口拉取行情和资金流
+3) akshare：从 akshare 拉取行情、资金流、热点板块（简化）
+
+兼容：Python 3.12（Windows / Linux / macOS）
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
+import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -84,6 +90,11 @@ def _http_get_json(url: str, timeout: int = 12) -> dict:
 
 
 def _normalize_ts_code(code: str) -> str:
+    code = str(code).strip()
+    if not code:
+        return code
+    if code.endswith(".SH") or code.endswith(".SZ"):
+        return code
     return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
 
 
@@ -122,7 +133,6 @@ def _fetch_eastmoney_market(page_size: int = 200) -> List[Dict[str, str]]:
 
 
 def _fetch_eastmoney_flow(page_size: int = 200) -> List[Dict[str, str]]:
-    # 资金流榜字段：f62 主力净流入，f66 超大单净流入，f184 主力净占比
     params = {
         "pn": 1,
         "pz": page_size,
@@ -152,6 +162,108 @@ def _fetch_eastmoney_flow(page_size: int = 200) -> List[Dict[str, str]]:
             }
         )
     return rows
+
+
+def _import_akshare() -> Any:
+    try:
+        return importlib.import_module("akshare")
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "未安装 akshare。请先执行: pip install akshare pandas"
+        ) from exc
+
+
+def _df_to_rows(df: Any) -> List[Dict[str, Any]]:
+    if hasattr(df, "to_dict"):
+        return df.to_dict(orient="records")
+    raise TypeError("akshare 返回结果不是 DataFrame，无法继续")
+
+
+def _pick_value(row: Dict[str, Any], keys: List[str], default: Any = 0) -> Any:
+    for k in keys:
+        if k in row and row[k] not in (None, ""):
+            return row[k]
+    return default
+
+
+def _fetch_akshare_market(limit: int = 200) -> List[Dict[str, str]]:
+    ak = _import_akshare()
+    spot_df = ak.stock_zh_a_spot_em()
+    records = _df_to_rows(spot_df)[:limit]
+
+    out: List[Dict[str, str]] = []
+    for r in records:
+        code = str(_pick_value(r, ["代码", "code"], "")).strip()
+        if not code:
+            continue
+        out.append(
+            {
+                "ts_code": _normalize_ts_code(code),
+                "name": str(_pick_value(r, ["名称", "name"], "")),
+                "close": str(_pick_value(r, ["最新价", "最新", "close"], 0)),
+                "pct_chg": str(_pick_value(r, ["涨跌幅", "pct_chg"], 0)),
+                "turnover_rate": str(_pick_value(r, ["换手率", "turnover_rate"], 0)),
+                "vol_ratio": str(_pick_value(r, ["量比", "vol_ratio"], 1)),
+            }
+        )
+    return out
+
+
+def _fetch_akshare_flow(limit: int = 200) -> List[Dict[str, str]]:
+    ak = _import_akshare()
+    flow_df = ak.stock_individual_fund_flow_rank(indicator="今日")
+    records = _df_to_rows(flow_df)[:limit]
+
+    out: List[Dict[str, str]] = []
+    for r in records:
+        code = str(_pick_value(r, ["代码", "code"], "")).strip()
+        if not code:
+            continue
+        out.append(
+            {
+                "ts_code": _normalize_ts_code(code),
+                "main_net_inflow": str(_pick_value(r, ["今日主力净流入-净额", "主力净流入", "main_net_inflow"], 0)),
+                "super_net_inflow": str(_pick_value(r, ["今日超大单净流入-净额", "超大单净流入", "super_net_inflow"], 0)),
+                "main_inflow_ratio": str(_pick_value(r, ["今日主力净流入-净占比", "主力净占比", "main_inflow_ratio"], 0)),
+            }
+        )
+    return out
+
+
+def _fetch_akshare_theme(board_top: int = 8, board_cons_limit: int = 40) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """简化热点：取热门行业板块，按排名映射热度，再拉板块成分股作为 theme_map。"""
+    ak = _import_akshare()
+
+    board_df = ak.stock_board_hot_rank_em()
+    boards = _df_to_rows(board_df)[:board_top]
+    if not boards:
+        return [], []
+
+    theme_rows: List[Dict[str, str]] = []
+    theme_map_rows: List[Dict[str, str]] = []
+
+    total = len(boards)
+    for idx, b in enumerate(boards):
+        board_name = str(_pick_value(b, ["板块名称", "名称", "name"], "")).strip()
+        if not board_name:
+            continue
+
+        heat_score = float(total - idx)
+        theme_rows.append({"theme": board_name, "heat_score": str(heat_score)})
+
+        try:
+            cons_df = ak.stock_board_industry_cons_em(symbol=board_name)
+            cons_rows = _df_to_rows(cons_df)[:board_cons_limit]
+            for c in cons_rows:
+                code = str(_pick_value(c, ["代码", "code"], "")).strip()
+                if not code:
+                    continue
+                theme_map_rows.append({"ts_code": _normalize_ts_code(code), "theme": board_name})
+        except Exception:
+            # 某些板块可能接口临时不可用，跳过该板块
+            continue
+
+    return theme_rows, theme_map_rows
 
 
 def build_theme_score(theme_rows: List[Dict[str, str]], theme_map_rows: List[Dict[str, str]]) -> Dict[str, Dict[str, float]]:
@@ -249,14 +361,23 @@ def score_stocks(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="资金流+热点自动选股")
-    parser.add_argument("--source", choices=["csv", "eastmoney"], default="csv", help="数据源：csv/eastmoney")
+    parser.add_argument("--source", choices=["csv", "eastmoney", "akshare"], default="csv", help="数据源：csv/eastmoney/akshare")
     parser.add_argument("--market", type=Path, help="行情 CSV（source=csv 时必填）")
     parser.add_argument("--flow", type=Path, help="资金流 CSV（source=csv 时必填）")
     parser.add_argument("--theme", type=Path, help="题材热度 CSV（可选）")
     parser.add_argument("--theme-map", type=Path, help="个股题材映射 CSV（可选）")
+
     parser.add_argument("--em-page-size", type=int, default=200, help="东方财富拉取股票数")
-    parser.add_argument("--top", type=int, default=20)
-    parser.add_argument("--output", type=Path, default=Path("picked_stocks.csv"))
+    parser.add_argument("--ak-limit", type=int, default=200, help="akshare 拉取股票数")
+    parser.add_argument("--ak-board-top", type=int, default=8, help="akshare 热点板块数量")
+    parser.add_argument("--ak-board-cons-limit", type=int, default=40, help="每个板块最多成分股数量")
+
+    parser.add_argument("--top", type=int, default=3, help="输出前 N 只股票，默认3")
+    parser.add_argument("--output", type=Path, default=Path("picked_stocks.csv"), help="输出 CSV 路径")
+
+    parser.add_argument("--auto-daily", action="store_true", help="开启每天自动筛选")
+    parser.add_argument("--daily-time", default="15:10", help="每天执行时间 HH:MM，默认 15:10")
+
     parser.add_argument("--w-money-flow", type=float, default=0.45)
     parser.add_argument("--w-momentum", type=float, default=0.25)
     parser.add_argument("--w-liquidity", type=float, default=0.15)
@@ -272,7 +393,7 @@ def build_weights(args: argparse.Namespace) -> FactorWeights:
     return weights
 
 
-def _load_theme_optional(args: argparse.Namespace) -> tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+def _load_theme_optional(args: argparse.Namespace) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
     if args.theme and args.theme_map:
         return (
             read_csv(args.theme, REQUIRED_THEME_COLUMNS, "theme"),
@@ -281,7 +402,7 @@ def _load_theme_optional(args: argparse.Namespace) -> tuple[List[Dict[str, str]]
     return [], []
 
 
-def load_data(args: argparse.Namespace) -> tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
+def load_data(args: argparse.Namespace) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
     if args.source == "csv":
         if not args.market or not args.flow:
             raise ValueError("source=csv 时必须提供 --market 和 --flow")
@@ -290,9 +411,19 @@ def load_data(args: argparse.Namespace) -> tuple[List[Dict[str, str]], List[Dict
         theme, theme_map = _load_theme_optional(args)
         return market, flow, theme, theme_map
 
-    market = _fetch_eastmoney_market(args.em_page_size)
-    flow = _fetch_eastmoney_flow(args.em_page_size)
+    if args.source == "eastmoney":
+        market = _fetch_eastmoney_market(args.em_page_size)
+        flow = _fetch_eastmoney_flow(args.em_page_size)
+        theme, theme_map = _load_theme_optional(args)
+        return market, flow, theme, theme_map
+
+    market = _fetch_akshare_market(args.ak_limit)
+    flow = _fetch_akshare_flow(args.ak_limit)
+
+    # akshare 模式：优先本地题材；若未提供则自动生成简化热点板块映射
     theme, theme_map = _load_theme_optional(args)
+    if not theme or not theme_map:
+        theme, theme_map = _fetch_akshare_theme(board_top=args.ak_board_top, board_cons_limit=args.ak_board_cons_limit)
     return market, flow, theme, theme_map
 
 
@@ -321,17 +452,49 @@ def write_output(rows: List[Dict[str, float | str]], path: Path, topn: int) -> N
 
     print("=== Top Picks ===")
     for r in selected:
-        print(f"{r['ts_code']:>10} {r['name']:<8} score={float(r['total_score']):.4f} risk={r['risk_flag']}")
+        print(f"{r['ts_code']:>10} {r['name']:<10} score={float(r['total_score']):.4f} risk={r['risk_flag']}")
     print(f"\n已输出到: {path}")
+
+
+def run_once(args: argparse.Namespace, weights: FactorWeights) -> None:
+    market, flow, theme, theme_map = load_data(args)
+    rows = score_stocks(market, flow, theme, theme_map, weights)
+    write_output(rows, args.output, args.top)
+
+
+def _next_run_time(daily_time: str) -> datetime:
+    try:
+        hh, mm = daily_time.split(":")
+        target = datetime.now().replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+    except Exception as exc:
+        raise ValueError("--daily-time 格式错误，必须是 HH:MM，例如 15:10") from exc
+
+    if target <= datetime.now():
+        target = target + timedelta(days=1)
+    return target
+
+
+def run_daily(args: argparse.Namespace, weights: FactorWeights) -> None:
+    print(f"已开启每日自动选股，执行时间: {args.daily_time}，Top={args.top}")
+    while True:
+        nxt = _next_run_time(args.daily_time)
+        wait_seconds = max(1, int((nxt - datetime.now()).total_seconds()))
+        print(f"下一次运行时间: {nxt.strftime('%Y-%m-%d %H:%M:%S')}，等待 {wait_seconds} 秒")
+        time.sleep(wait_seconds)
+        try:
+            run_once(args, weights)
+        except Exception as exc:
+            print(f"本次执行失败: {exc}")
 
 
 def main() -> None:
     args = parse_args()
     weights = build_weights(args)
 
-    market, flow, theme, theme_map = load_data(args)
-    rows = score_stocks(market, flow, theme, theme_map, weights)
-    write_output(rows, args.output, args.top)
+    if args.auto_daily:
+        run_daily(args, weights)
+    else:
+        run_once(args, weights)
 
 
 if __name__ == "__main__":
