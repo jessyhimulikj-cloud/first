@@ -31,10 +31,30 @@ class FakeAk:
         assert period == "daily"
         assert adjust == "qfq"
         if symbol == "600000":
-            closes = [8, 8.2, 8.4, 8.6, 8.9, 9.2, 10]
+            closes = [7.8, 8.0, 8.1, 8.2, 8.35, 8.5, 8.7, 8.9, 9.2, 9.6, 10.0]
+            vols = [100, 110, 120, 130, 140, 180, 190, 210, 230, 240, 420]
+            pcts = [0.5, 0.8, 1.0, 0.4, 1.2, 1.1, 1.8, 2.0, 2.2, 2.6, 3.0]
         else:
-            closes = [9, 9.1, 9.3, 9.6, 10.0, 10.5, 11]
-        return FakeDF([{"收盘": c} for c in closes])
+            closes = [8.9, 9.0, 9.05, 9.2, 9.35, 9.5, 9.7, 9.9, 10.2, 10.6, 11.0]
+            vols = [120, 125, 130, 140, 150, 170, 180, 190, 210, 220, 420]
+            pcts = [0.3, 0.6, 0.7, 0.5, 1.0, 1.2, 1.4, 1.8, 2.0, 2.4, 2.8]
+        return FakeDF([{"收盘": c, "成交量": v, "涨跌幅": p} for c, v, p in zip(closes, vols, pcts)])
+
+    def stock_board_hot_rank_em(self):
+        return FakeDF(
+            [
+                {"板块名称": "人工智能", "涨跌幅": 3.5},
+                {"板块名称": "机器人", "涨跌幅": 2.0},
+                {"板块名称": "冷门板块", "涨跌幅": -1.0},
+                {"板块名称": "次热板块", "涨跌幅": 1.0},
+                {"板块名称": "普通板块", "涨跌幅": 0.5},
+            ]
+        )
+
+    def stock_board_industry_cons_em(self, symbol):
+        if symbol == "人工智能":
+            return FakeDF([{"代码": "600000"}, {"代码": "000001"}])
+        return FakeDF([])
 
 
 def test_normalize_ts_code():
@@ -68,6 +88,8 @@ def test_fetch_akshare_short_term(monkeypatch):
     assert "total_score" in rows[0]
     assert "momentum_3" in rows[0]
     assert "momentum_5" in rows[0]
+    assert "volume_ratio" in rows[0]
+    assert rows[0]["trend_flag"] == "uptrend_confirmed"
 
 
 def test_robust_zscores_non_empty():

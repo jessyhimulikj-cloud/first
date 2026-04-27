@@ -87,10 +87,16 @@ python stock_picker.py \
 - `liquidity_z`：成交额的 z 分数
 - `pct_chg`：今日涨跌幅
 
-`total_score = momentum_5 * 0.35 + momentum_3 * 0.25 + liquidity_z * 0.25 + pct_chg * 0.15`
+新增短线增强规则：
+- 趋势确认（必须满足）：`5日线 > 10日线` 且 `收盘价 > 5日线`
+- 放量确认：`今日成交量 > 5日均量 * 1.5`
+- 剔除弱势：最近 5 天涨幅 < 0 剔除；最近 3 天有跌停（近似 <= -9.5%）剔除
+- 热点强化：仅保留当前涨幅排名前 20% 板块成分股
+
+`total_score = momentum_5 * 0.30 + momentum_3 * 0.20 + liquidity_z * 0.30 + pct_chg * 0.20`
 
 ### 输出字段
-- `ts_code, name, close, pct_chg, amount, momentum_3, momentum_5, total_score, risk_flag`
+- `ts_code, name, close, pct_chg, amount, momentum_3, momentum_5, volume_ratio, trend_flag, total_score, risk_flag`
 
 ---
 

@@ -133,9 +133,38 @@ def _calc_momentum(close_list: List[float], days: int) -> float:
     return (latest / base - 1.0) * 100.0
 
 
+def _fetch_hot_board_symbols(ak: Any) -> set[str]:
+    """仅保留当前涨幅排名前20%的板块成分股。"""
+    hot_symbols: set[str] = set()
+    try:
+        board_rows = _df_to_rows(ak.stock_board_hot_rank_em())
+        if not board_rows:
+            return hot_symbols
+
+        board_rows.sort(key=lambda x: float(_pick(x, ["涨跌幅", "今日涨跌幅", "change_percent"], 0) or 0), reverse=True)
+        top_n = max(1, int(len(board_rows) * 0.2))
+
+        for b in board_rows[:top_n]:
+            board_name = str(_pick(b, ["板块名称", "名称", "name"], "")).strip()
+            if not board_name:
+                continue
+            try:
+                cons_rows = _df_to_rows(ak.stock_board_industry_cons_em(symbol=board_name))
+                for c in cons_rows:
+                    code = str(_pick(c, ["代码", "code"], "")).strip()
+                    if code:
+                        hot_symbols.add(code)
+            except Exception:
+                continue
+    except Exception:
+        return set()
+    return hot_symbols
+
+
 def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float | str]]:
     ak = _import_akshare()
     spot_rows = _df_to_rows(ak.stock_zh_a_spot_em())
+    hot_symbols = _fetch_hot_board_symbols(ak)
 
     candidates: List[Dict[str, Any]] = []
     for r in spot_rows:
@@ -150,6 +179,8 @@ def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float 
 
         excluded, reason = _is_excluded_stock(code, name, close, amount, pct_chg)
         if excluded:
+            continue
+        if hot_symbols and code not in hot_symbols:
             continue
 
         candidates.append(
@@ -174,8 +205,30 @@ def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float 
             hist_df = ak.stock_zh_a_hist(symbol=str(c["code"]), period="daily", adjust="qfq")
             hist_rows = _df_to_rows(hist_df)
             closes = [float(_pick(h, ["收盘", "close"], 0) or 0) for h in hist_rows if float(_pick(h, ["收盘", "close"], 0) or 0) > 0]
+            vols = [float(_pick(h, ["成交量", "volume"], 0) or 0) for h in hist_rows]
+            pct_list = [float(_pick(h, ["涨跌幅", "pct_chg"], 0) or 0) for h in hist_rows]
+            if len(closes) < 11 or len(vols) < 6 or len(pct_list) < 3:
+                continue
+
+            ma5 = sum(closes[-5:]) / 5.0
+            ma10 = sum(closes[-10:]) / 10.0
+            trend_ok = ma5 > ma10 and closes[-1] > ma5
+            if not trend_ok:
+                continue
+
             momentum_3 = _calc_momentum(closes, 3)
             momentum_5 = _calc_momentum(closes, 5)
+            if momentum_5 < 0:
+                continue
+            if any(p <= -9.5 for p in pct_list[-3:]):
+                continue
+
+            avg_vol_5 = sum(vols[-5:]) / 5.0 if sum(vols[-5:]) > 0 else 0.0
+            if avg_vol_5 <= 0:
+                continue
+            volume_ratio = vols[-1] / avg_vol_5
+            if volume_ratio <= 1.5:
+                continue
 
             picked.append(
                 {
@@ -186,6 +239,8 @@ def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float 
                     "amount": c["amount"],
                     "momentum_3": momentum_3,
                     "momentum_5": momentum_5,
+                    "volume_ratio": volume_ratio,
+                    "trend_flag": "uptrend_confirmed",
                     "risk_flag": "normal",
                 }
             )
@@ -196,10 +251,10 @@ def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float 
     for idx, r in enumerate(picked):
         r["liquidity_z"] = liquidity_z[idx]
         r["total_score"] = (
-            0.35 * float(r["momentum_5"])
-            + 0.25 * float(r["momentum_3"])
-            + 0.25 * float(r["liquidity_z"])
-            + 0.15 * float(r["pct_chg"])
+            0.30 * float(r["momentum_5"])
+            + 0.20 * float(r["momentum_3"])
+            + 0.30 * float(r["liquidity_z"])
+            + 0.20 * float(r["pct_chg"])
         )
 
     picked.sort(key=lambda x: float(x["total_score"]), reverse=True)
@@ -455,7 +510,19 @@ def _load_legacy_data(args: argparse.Namespace) -> Tuple[List[Dict[str, str]], L
 def write_output(rows: List[Dict[str, float | str]], path: Path, topn: int, source: str) -> None:
     selected = rows[:topn]
     if source == "akshare":
-        columns = ["ts_code", "name", "close", "pct_chg", "amount", "momentum_3", "momentum_5", "total_score", "risk_flag"]
+        columns = [
+            "ts_code",
+            "name",
+            "close",
+            "pct_chg",
+            "amount",
+            "momentum_3",
+            "momentum_5",
+            "volume_ratio",
+            "trend_flag",
+            "total_score",
+            "risk_flag",
+        ]
     else:
         columns = ["ts_code", "name", "close", "pct_chg", "total_score", "risk_flag"]
 
