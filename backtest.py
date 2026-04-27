@@ -171,7 +171,7 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
         closes = [c for c in closes if c > 0]
         vols = [_to_float(r.get("amount", 0)) for r in rows[: idx + 1]]
         pcts = [_to_float(r.get("pct_chg", 0)) for r in rows[: idx + 1]]
-        if len(closes) < 11 or len(vols) < 6 or len(pcts) < 3:
+        if len(closes) < 20 or len(vols) < 6 or len(pcts) < 3:
             continue
 
         name = name_map.get(symbol, symbol)
@@ -196,6 +196,17 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
         if m10 > 35:
             continue
         if any(p <= -9.5 for p in pcts[-3:]):
+            continue
+        if sum(1 for p in pcts[-3:] if p < 0) >= 2:
+            continue
+
+        high_20 = max(closes[-20:])
+        if high_20 > 0 and (high_20 - close) / high_20 < 0.05:
+            continue
+
+        recent5 = closes[-5:]
+        max_draw_5 = (max(recent5) - min(recent5)) / max(recent5) if max(recent5) > 0 else 0
+        if max_draw_5 > 0.08:
             continue
 
         avg_vol5 = sum(vols[-5:]) / 5.0
@@ -227,7 +238,7 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
     liq_z = robust_zscores([c["amount"] for c in candidates])
     for i, c in enumerate(candidates):
         c["liquidity_z"] = liq_z[i]
-        c["total_score"] = 0.35 * c["momentum_5"] + 0.25 * c["momentum_3"] + 0.25 * c["liquidity_z"] + 0.15 * c["pct_chg"]
+        c["total_score"] = 0.30 * c["momentum_5"] + 0.20 * c["momentum_3"] + 0.30 * c["liquidity_z"] + 0.20 * c["pct_chg"]
 
     candidates.sort(key=lambda x: x["total_score"], reverse=True)
     top3 = candidates[:3]
@@ -250,7 +261,7 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
         sell_price = _to_float(rows[sell_idx].get("close", 0))
         if sell_price <= 0:
             return None
-        return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
+        return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, (sell_price / buy_price - 1) * 0.5, mode)
 
     if mode == "hold_5":
         sell_idx = buy_idx + 4
@@ -259,11 +270,11 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
         sell_price = _to_float(rows[sell_idx].get("close", 0))
         if sell_price <= 0:
             return None
-        return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
+        return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, (sell_price / buy_price - 1) * 0.5, mode)
 
     # take_profit_stop_loss
-    tp = buy_price * 1.05
-    sl = buy_price * 0.975
+    tp = buy_price * 1.04
+    sl = buy_price * 0.98
     last_idx = min(len(rows) - 1, buy_idx + 4)
 
     for i in range(buy_idx, last_idx + 1):
@@ -271,14 +282,14 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
         low = _to_float(day.get("low", 0))
         high = _to_float(day.get("high", 0))
         if low > 0 and low <= sl:
-            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, sl, sl / buy_price - 1, mode)
+            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, sl, (sl / buy_price - 1) * 0.5, mode)
         if high > 0 and high >= tp:
-            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, tp, tp / buy_price - 1, mode)
+            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, tp, (tp / buy_price - 1) * 0.5, mode)
 
     sell_price = _to_float(rows[last_idx].get("close", 0))
     if sell_price <= 0:
         return None
-    return TradeRecord(symbol, rows[buy_idx]["date"], rows[last_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
+    return TradeRecord(symbol, rows[buy_idx]["date"], rows[last_idx]["date"], buy_price, sell_price, (sell_price / buy_price - 1) * 0.5, mode)
 
 
 def max_drawdown(returns: List[float]) -> float:
