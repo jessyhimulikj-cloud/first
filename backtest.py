@@ -59,10 +59,10 @@ def _cache_path(cache_dir: Path, symbol: str) -> Path:
     return cache_dir / f"{symbol}.csv"
 
 
-def load_universe_300(cache_dir: Path) -> List[str]:
-    """优先沪深300成分；失败则回退到全市场前300（按成交额）。"""
+def load_universe(cache_dir: Path, size: int = 50) -> List[str]:
+    """优先沪深300成分；失败则回退到全市场按成交额排序。"""
     ak = _import_akshare()
-    cache_file = cache_dir / "universe_300.csv"
+    cache_file = cache_dir / f"universe_{size}.csv"
     if cache_file.exists():
         with cache_file.open("r", encoding="utf-8", newline="") as f:
             return [row[0] for row in csv.reader(f) if row]
@@ -79,7 +79,10 @@ def load_universe_300(cache_dir: Path) -> List[str]:
         spot_df = ak.stock_zh_a_spot_em()
         rows = _df_to_rows(spot_df)
         rows.sort(key=lambda x: _to_float(x.get("成交额", 0)), reverse=True)
-        codes = [str(r.get("代码", "")).strip() for r in rows[:300] if str(r.get("代码", "")).strip()]
+        codes = [str(r.get("代码", "")).strip() for r in rows[:size] if str(r.get("代码", "")).strip()]
+
+    if size > 0:
+        codes = codes[:size]
 
     with cache_file.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
@@ -318,7 +321,10 @@ def save_result(path: Path, mode_to_metrics: Dict[str, Dict[str, Any]]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="短线策略回测")
     parser.add_argument("--source", choices=["akshare", "eastmoney"], default="akshare", help="当前优先使用 akshare")
-    parser.add_argument("--years", type=int, default=3)
+    parser.add_argument("--months", type=int, default=3, help="回测月数，默认最近3个月")
+    parser.add_argument("--universe-size", type=int, default=50, help="股票池数量，默认50")
+    parser.add_argument("--max-days", type=int, default=60, help="最多回测交易日数量，默认60")
+    parser.add_argument("--modes", nargs="+", default=["hold_3"], choices=["hold_3", "hold_5", "take_profit_stop_loss"], help="卖出模式")
     parser.add_argument("--limit-300", action="store_true", help="限制为沪深300成分股，提升速度")
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache_backtest"))
     parser.add_argument("--output", type=Path, default=Path("backtest_result.csv"))
@@ -333,12 +339,12 @@ def main() -> None:
     args.cache_dir.mkdir(parents=True, exist_ok=True)
 
     end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=365 * args.years + 30)
+    start_dt = end_dt - timedelta(days=31 * args.months + 10)
     start = start_dt.strftime("%Y%m%d")
     end = end_dt.strftime("%Y%m%d")
 
     print(f"[1/5] 加载股票池（start={start}, end={end}）...")
-    universe = load_universe_300(args.cache_dir) if args.limit_300 else load_universe_300(args.cache_dir)
+    universe = load_universe(args.cache_dir, size=args.universe_size)
     print(f"股票池数量: {len(universe)}")
 
     print("[2/5] 加载历史数据（带缓存）...")
@@ -347,7 +353,7 @@ def main() -> None:
         rows = load_symbol_history(symbol, start, end, args.cache_dir)
         if rows:
             universe_data[symbol] = rows
-        if i % 30 == 0:
+        if i % 10 == 0:
             print(f"  已加载 {i}/{len(universe)}")
 
     if not universe_data:
@@ -367,10 +373,11 @@ def main() -> None:
         pass
 
     print("[4/5] 执行回测...")
-    modes = ["hold_3", "hold_5", "take_profit_stop_loss"]
+    modes = args.modes
     mode_trades: Dict[str, List[TradeRecord]] = {m: [] for m in modes}
 
-    for idx, day in enumerate(trading_days[:-6]):
+    trade_days = trading_days[-args.max_days :] if args.max_days > 0 else trading_days
+    for idx, day in enumerate(trade_days[:-6]):
         symbol = pick_stock_for_day(day, universe_data, name_map)
         if not symbol:
             continue
@@ -388,8 +395,8 @@ def main() -> None:
             except Exception:
                 continue
 
-        if idx % 50 == 0:
-            print(f"  回测进度: {idx}/{len(trading_days)}")
+        if idx % 20 == 0:
+            print(f"  回测进度: {idx}/{len(trade_days)}")
 
     print("[5/5] 统计并输出...")
     mode_to_metrics = {m: calc_metrics(ts) for m, ts in mode_trades.items()}

@@ -1,4 +1,4 @@
-from backtest import TradeRecord, calc_metrics, max_drawdown, run_trade
+from backtest import TradeRecord, calc_metrics, max_drawdown, parse_args, run_trade
 
 
 def test_max_drawdown():
@@ -27,3 +27,12 @@ def test_run_trade_accepts_string_numeric_fields():
     tr = run_trade("000001", 0, rows, "hold_3")
     assert tr is not None
     assert tr.sell_price > 0
+
+
+def test_parse_args_defaults(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["backtest.py"])
+    args = parse_args()
+    assert args.months == 3
+    assert args.universe_size == 50
+    assert args.max_days == 60
+    assert args.modes == ["hold_3"]
