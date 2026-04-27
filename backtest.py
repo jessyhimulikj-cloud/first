@@ -146,6 +146,59 @@ def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> L
     return norm_rows
 
 
+def load_hs300_history(start: str, end: str, cache_dir: Path) -> List[Dict[str, Any]]:
+    """加载沪深300指数历史，用于大盘环境过滤。"""
+    cache_file = cache_dir / "hs300_index.csv"
+    if cache_file.exists():
+        with cache_file.open("r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                d = str(r.get("date", "")).replace("-", "")
+                if not d or not (start <= d <= end):
+                    continue
+                out.append({"date": d, "close": _to_float(r.get("close", 0))})
+            return out
+
+    ak = _import_akshare()
+    try:
+        idx_df = ak.stock_zh_index_daily_em(symbol="sh000300")
+        idx_rows = _df_to_rows(idx_df)
+    except Exception:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for r in idx_rows:
+        d = str(r.get("date", "")).replace("-", "")
+        close = _to_float(r.get("close", 0))
+        if d and close > 0:
+            out.append({"date": d, "close": close})
+
+    with cache_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["date", "close"])
+        writer.writeheader()
+        writer.writerows(out)
+
+    return [r for r in out if start <= r["date"] <= end]
+
+
+def build_hs300_filter(index_rows: List[Dict[str, Any]]) -> Dict[str, bool]:
+    """返回 date -> 是否允许交易（close >= ma20）。"""
+    if not index_rows:
+        return {}
+    rows = sorted(index_rows, key=lambda x: x["date"])
+    allow: Dict[str, bool] = {}
+    closes: List[float] = []
+    for r in rows:
+        closes.append(float(r["close"]))
+        if len(closes) < 20:
+            allow[r["date"]] = True
+        else:
+            ma20 = sum(closes[-20:]) / 20.0
+            allow[r["date"]] = float(r["close"]) >= ma20
+    return allow
+
+
 def momentum(closes: List[float], days: int) -> float:
     if len(closes) < days + 1:
         raise ValueError("历史不足")
@@ -249,7 +302,8 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, 
         return None
     # 严格使用 T 日收盘选股、T+1 开盘买入
     open_gap_pct = (next_open / signal_close - 1.0) * 100
-    if open_gap_pct >= 2:
+    # 次日开盘涨幅必须在 [-1%, +2%]
+    if open_gap_pct > 2 or open_gap_pct < -1:
         return None
 
     # 买入价修正为 next_day_open，避免回测偏差
@@ -390,6 +444,10 @@ def main() -> None:
     trading_days = sorted({r["date"] for rows in universe_data.values() for r in rows})
     print(f"交易日数量: {len(trading_days)}")
 
+    print("[3.5/5] 加载沪深300环境过滤...")
+    hs300_rows = load_hs300_history(start, end, args.cache_dir)
+    hs300_allow = build_hs300_filter(hs300_rows)
+
     # 名称映射（用实时快照，失败则用代码）
     name_map: Dict[str, str] = {}
     try:
@@ -407,6 +465,8 @@ def main() -> None:
     for idx, day in enumerate(trade_days[:-6]):
         symbol = pick_stock_for_day(day, universe_data, name_map)
         if not symbol:
+            continue
+        if hs300_allow and not hs300_allow.get(day, True):
             continue
 
         rows = universe_data.get(symbol, [])

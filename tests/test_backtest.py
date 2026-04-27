@@ -29,6 +29,16 @@ def test_run_trade_accepts_string_numeric_fields():
     assert tr.sell_price > 0
 
 
+def test_run_trade_gap_filter():
+    rows_gap_up = [
+        {"date": "20240101", "open": "10", "high": "10.2", "low": "9.8", "close": "10"},
+        {"date": "20240102", "open": "10.3", "high": "10.5", "low": "10.1", "close": "10.4"},
+        {"date": "20240103", "open": "10.2", "high": "10.4", "low": "10.0", "close": "10.3"},
+        {"date": "20240104", "open": "10.2", "high": "10.4", "low": "10.0", "close": "10.3"},
+    ]
+    assert run_trade("000001", 0, rows_gap_up, "hold_3", 0.003, 0.001) is None
+
+
 def test_parse_args_defaults(monkeypatch):
     monkeypatch.setattr("sys.argv", ["backtest.py"])
     args = parse_args()

@@ -120,10 +120,17 @@ pytest -q
 python backtest.py --months 3 --universe-size 50 --max-days 60 --output backtest_result.csv
 ```
 
+更激进样例：
+```bash
+python backtest.py --months 6 --universe-size 100 --max-days 120 --output backtest_result.csv
+```
+
 ### 回测规则（实现）
 
 - 每个交易日收盘：按 `stock_picker` 短线逻辑打分，选 Top3 中分数最高 1 只
 - 次日开盘涨幅 `<2%` 才允许买入，买入价使用 `next_day_open`
+- 次日开盘涨幅需在 `-1% ~ +2%`，高开>2%不买、低开>1%不买
+- 大盘过滤：若沪深300收盘 < 20日均线，当天不交易
 - 三种卖出策略：
   - 核心：止盈 +5%，止损 -2%，最长持有 3 天
 - 回测仓位：单次 100% 仓位
