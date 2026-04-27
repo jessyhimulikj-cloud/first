@@ -99,3 +99,39 @@ python stock_picker.py \
 ```bash
 pytest -q
 ```
+
+---
+
+## 5. 回测（新增 backtest.py）
+
+`backtest.py` 用于验证短线策略，默认回测最近 3 年，并输出 `backtest_result.csv`。
+
+### 运行命令
+
+```bash
+python backtest.py --source akshare --years 3 --limit-300 --output backtest_result.csv
+```
+
+### 回测规则（实现）
+
+- 每个交易日收盘：按 `stock_picker` 短线逻辑打分，选 Top3 中分数最高 1 只
+- 次日开盘买入
+- 三种卖出策略：
+  - `hold_3`：持有 3 天
+  - `hold_5`：持有 5 天
+  - `take_profit_stop_loss`：止盈 +6%，止损 -3%（最多观察 5 天）
+
+### 输出指标
+
+- 总交易次数
+- 胜率
+- 平均收益
+- 最大回撤
+- 盈亏比
+- 每年收益
+
+### 性能与稳定性
+
+- 带进度打印（加载数据、回测进度）
+- 带异常处理（单标的失败自动跳过）
+- 带数据缓存（默认 `.cache_backtest/`，避免重复请求）
