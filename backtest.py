@@ -93,7 +93,23 @@ def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> L
     if cache_file.exists():
         with cache_file.open("r", encoding="utf-8", newline="") as f:
             rows = list(csv.DictReader(f))
-            return [r for r in rows if start <= str(r["date"]).replace("-", "") <= end]
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                d = str(r.get("date", "")).replace("-", "")
+                if not d or not (start <= d <= end):
+                    continue
+                out.append(
+                    {
+                        "date": d,
+                        "open": _to_float(r.get("open", 0)),
+                        "high": _to_float(r.get("high", 0)),
+                        "low": _to_float(r.get("low", 0)),
+                        "close": _to_float(r.get("close", 0)),
+                        "pct_chg": _to_float(r.get("pct_chg", 0)),
+                        "amount": _to_float(r.get("amount", 0)),
+                    }
+                )
+            return out
 
     ak = _import_akshare()
     try:
@@ -142,10 +158,20 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
             continue
 
         row = rows[idx]
-        closes = [r["close"] for r in rows[: idx + 1]]
+        close = _to_float(row.get("close", 0))
+        amount = _to_float(row.get("amount", 0))
+        pct_chg = _to_float(row.get("pct_chg", 0))
+        if close <= 0 or amount <= 0:
+            continue
+
+        closes = [_to_float(r.get("close", 0)) for r in rows[: idx + 1]]
+        closes = [c for c in closes if c > 0]
+        if len(closes) < 6:
+            continue
 
         name = name_map.get(symbol, symbol)
-        excluded, _ = _is_excluded_stock(symbol, name, row["close"], row["amount"], row["pct_chg"])
+        # 关键修复：过滤前先转为 float，避免 str/int 比较异常
+        excluded, _ = _is_excluded_stock(symbol, name, close, amount, pct_chg)
         if excluded:
             continue
 
@@ -158,9 +184,9 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
         candidates.append(
             {
                 "symbol": symbol,
-                "close": row["close"],
-                "pct_chg": row["pct_chg"],
-                "amount": row["amount"],
+                "close": close,
+                "pct_chg": pct_chg,
+                "amount": amount,
                 "momentum_3": m3,
                 "momentum_5": m5,
             }
@@ -184,7 +210,7 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
     if buy_idx >= len(rows):
         return None
 
-    buy_price = rows[buy_idx]["open"]
+    buy_price = _to_float(rows[buy_idx].get("open", 0))
     if buy_price <= 0:
         return None
 
@@ -192,14 +218,18 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
         sell_idx = buy_idx + 2
         if sell_idx >= len(rows):
             return None
-        sell_price = rows[sell_idx]["close"]
+        sell_price = _to_float(rows[sell_idx].get("close", 0))
+        if sell_price <= 0:
+            return None
         return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
 
     if mode == "hold_5":
         sell_idx = buy_idx + 4
         if sell_idx >= len(rows):
             return None
-        sell_price = rows[sell_idx]["close"]
+        sell_price = _to_float(rows[sell_idx].get("close", 0))
+        if sell_price <= 0:
+            return None
         return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
 
     # take_profit_stop_loss
@@ -209,12 +239,16 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
 
     for i in range(buy_idx, last_idx + 1):
         day = rows[i]
-        if day["low"] <= sl:
+        low = _to_float(day.get("low", 0))
+        high = _to_float(day.get("high", 0))
+        if low > 0 and low <= sl:
             return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, sl, sl / buy_price - 1, mode)
-        if day["high"] >= tp:
+        if high > 0 and high >= tp:
             return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, tp, tp / buy_price - 1, mode)
 
-    sell_price = rows[last_idx]["close"]
+    sell_price = _to_float(rows[last_idx].get("close", 0))
+    if sell_price <= 0:
+        return None
     return TradeRecord(symbol, rows[buy_idx]["date"], rows[last_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
 
 

@@ -1,4 +1,4 @@
-from backtest import TradeRecord, calc_metrics, max_drawdown
+from backtest import TradeRecord, calc_metrics, max_drawdown, run_trade
 
 
 def test_max_drawdown():
@@ -15,3 +15,15 @@ def test_calc_metrics_basic():
     assert m["total_trades"] == 2
     assert 0 <= m["win_rate"] <= 1
     assert "2024" in m["annual_returns"]
+
+
+def test_run_trade_accepts_string_numeric_fields():
+    rows = [
+        {"date": "20240101", "open": "10", "high": "10.2", "low": "9.8", "close": "10", "amount": "100000000", "pct_chg": "1.0"},
+        {"date": "20240102", "open": "10.1", "high": "10.3", "low": "9.9", "close": "10.2", "amount": "120000000", "pct_chg": "1.2"},
+        {"date": "20240103", "open": "10.2", "high": "10.6", "low": "10.0", "close": "10.5", "amount": "130000000", "pct_chg": "2.0"},
+        {"date": "20240104", "open": "10.5", "high": "10.8", "low": "10.4", "close": "10.7", "amount": "150000000", "pct_chg": "1.9"},
+    ]
+    tr = run_trade("000001", 0, rows, "hold_3")
+    assert tr is not None
+    assert tr.sell_price > 0
