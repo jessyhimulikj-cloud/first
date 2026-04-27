@@ -398,17 +398,19 @@ def save_result(path: Path, mode_to_metrics: Dict[str, Dict[str, Any]]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="短线策略回测")
-    parser.add_argument("--source", choices=["akshare", "eastmoney"], default="akshare", help="当前优先使用 akshare")
-    parser.add_argument("--months", type=int, default=3, help="回测月数，默认最近3个月")
-    parser.add_argument("--universe-size", type=int, default=50, help="股票池数量，默认50")
-    parser.add_argument("--max-days", type=int, default=60, help="最多回测交易日数量，默认60")
-    parser.add_argument("--modes", nargs="+", default=["hold_3"], choices=["hold_3", "hold_5", "take_profit_stop_loss"], help="卖出模式")
-    parser.add_argument("--fee-rate", type=float, default=0.003, help="总手续费比例，默认0.3%")
-    parser.add_argument("--slippage", type=float, default=0.001, help="单边滑点比例，默认0.1%")
-    parser.add_argument("--limit-300", action="store_true", help="限制为沪深300成分股，提升速度")
-    parser.add_argument("--cache-dir", type=Path, default=Path(".cache_backtest"))
-    parser.add_argument("--output", type=Path, default=Path("backtest_result.csv"))
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", choices=["akshare", "eastmoney"], default="akshare", help="data source")
+    parser.add_argument("--months", type=int, default=3, help="backtest months")
+    parser.add_argument("--universe-size", type=int, default=50, help="stock universe size")
+    parser.add_argument("--max-days", type=int, default=60, help="max trading days")
+    parser.add_argument("--fee-rate", type=float, default=0.003, help="transaction fee")
+    parser.add_argument("--slippage", type=float, default=0.001, help="slippage")
+    parser.add_argument("--modes", nargs="+", default=["hold_3"], choices=["hold_3", "hold_5", "take_profit_stop_loss"], help="sell mode")
+    parser.add_argument("--limit-300", action="store_true", help="use hs300 universe")
+    parser.add_argument("--cache-dir", type=Path, default=Path(".cache_backtest"), help="cache folder")
+    parser.add_argument("--output", type=Path, default=Path("backtest_result.csv"), help="output csv path")
     return parser.parse_args()
 
 
