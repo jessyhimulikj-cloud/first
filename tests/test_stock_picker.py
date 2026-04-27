@@ -31,11 +31,11 @@ class FakeAk:
         assert period == "daily"
         assert adjust == "qfq"
         if symbol == "600000":
-            closes = [12.0, 11.5, 11.0, 10.8, 10.6, 10.4, 10.2, 10.1, 10.0, 10.0, 10.1, 10.2, 10.25, 10.3, 10.35, 10.4, 10.45, 10.5, 10.55, 10.6]
+            closes = [12.0, 11.5, 11.0, 10.8, 10.6, 10.4, 10.2, 10.1, 10.0, 10.0, 10.1, 10.2, 10.3, 10.4, 10.45, 10.5, 10.58, 10.65, 10.72, 10.8]
             vols = [200, 210, 220, 180, 170, 160, 150, 145, 140, 138, 136, 135, 140, 145, 150, 160, 170, 180, 190, 260]
             pcts = [-1.5, -1.2, -1.0, -0.8, -0.5, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.2, 0.3, 0.4, 0.4, 0.5, 0.5, 0.5, 0.4, 0.5]
         else:
-            closes = [11.8, 11.3, 10.9, 10.7, 10.5, 10.3, 10.1, 10.0, 9.95, 9.9, 9.95, 10.0, 10.05, 10.1, 10.15, 10.2, 10.25, 10.3, 10.35, 10.4]
+            closes = [11.8, 11.3, 10.9, 10.7, 10.5, 10.3, 10.1, 10.0, 9.95, 9.9, 9.95, 10.0, 10.05, 10.1, 10.2, 10.28, 10.35, 10.43, 10.5, 10.58]
             vols = [190, 195, 200, 170, 160, 155, 150, 145, 140, 138, 136, 134, 138, 142, 146, 150, 158, 166, 174, 250]
             pcts = [-1.2, -1.0, -0.8, -0.6, -0.4, -0.3, -0.2, -0.1, -0.1, -0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4, 0.4, 0.4, 0.4]
         return FakeDF([{"收盘": c, "成交量": v, "涨跌幅": p} for c, v, p in zip(closes, vols, pcts)])
@@ -66,9 +66,9 @@ def test_is_excluded_stock():
     assert _is_excluded_stock("000001", "*ST测试", 10, 2e8, 1)[0] is True
     assert _is_excluded_stock("800001", "某股票", 10, 2e8, 1)[0] is True
     assert _is_excluded_stock("000001", "正常", 2.8, 2e8, 1)[0] is True
-    assert _is_excluded_stock("000001", "正常", 10, 9e7, 1)[0] is True
-    assert _is_excluded_stock("000001", "正常", 10, 2e8, -6)[0] is True
-    assert _is_excluded_stock("000001", "正常", 10, 2e8, 8)[0] is True
+    assert _is_excluded_stock("000001", "正常", 10, 9e7, 1)[0] is False
+    assert _is_excluded_stock("000001", "正常", 10, 2e8, -6)[0] is False
+    assert _is_excluded_stock("000001", "正常", 10, 2e8, 8)[0] is False
 
 
 def test_calc_momentum():
@@ -93,7 +93,7 @@ def test_fetch_akshare_short_term(monkeypatch):
     assert "ma5" in rows[0]
     assert "ma10" in rows[0]
     assert "volume_ratio" in rows[0]
-    assert rows[0]["trend_flag"] == "uptrend_confirmed"
+    assert rows[0]["trend_flag"] == "trend_momentum_ok"
 
 
 def test_robust_zscores_non_empty():

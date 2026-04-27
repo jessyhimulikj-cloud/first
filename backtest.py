@@ -154,7 +154,6 @@ def momentum(closes: List[float], days: int) -> float:
 
 def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]], name_map: Dict[str, str]) -> str | None:
     candidates: List[Dict[str, Any]] = []
-    relaxed_candidates: List[Dict[str, Any]] = []
 
     for symbol, rows in universe_data.items():
         idx = next((i for i, r in enumerate(rows) if r["date"] == day), -1)
@@ -190,21 +189,23 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
 
         ma5 = sum(closes[-5:]) / 5.0
         ma10 = sum(closes[-10:]) / 10.0
+        ma10_prev = sum(closes[-11:-1]) / 10.0
         if not (close > ma5 > ma10):
             continue
-        if any(p <= -9.5 for p in pcts[-3:]):
+        if not (ma10 > ma10_prev):
             continue
-
-        high_20 = max(closes[-20:])
-        if high_20 > 0 and (high_20 - close) / high_20 < 0.03:
+        if not (3 <= m5 <= 15):
             continue
 
         avg_vol5 = sum(vols[-5:]) / 5.0
         if avg_vol5 <= 0:
             continue
         volume_ratio = amount / avg_vol5
+        if volume_ratio <= 1.3:
+            continue
 
-        row = {
+        candidates.append(
+            {
             "symbol": symbol,
             "close": close,
             "pct_chg": pct_chg,
@@ -216,13 +217,9 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
             "ma5": ma5,
             "ma10": ma10,
             "volume_ratio": volume_ratio,
-        }
-        relaxed_candidates.append(row)
-        if (close > ma5 > ma10) and (volume_ratio > 1.2):
-            candidates.append(row)
+            }
+        )
 
-    if not candidates and relaxed_candidates:
-        candidates = relaxed_candidates
     if not candidates:
         return None
 
@@ -241,32 +238,23 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str) 
     if buy_idx >= len(rows):
         return None
 
-    buy_price = _to_float(rows[buy_idx].get("open", 0))
+    signal_close = _to_float(rows[day_idx].get("close", 0))
+    next_open = _to_float(rows[buy_idx].get("open", 0))
+    if signal_close <= 0 or next_open <= 0:
+        return None
+    open_gap_pct = (next_open / signal_close - 1.0) * 100
+    if open_gap_pct >= 2:
+        return None
+
+    ma5_signal = sum(_to_float(r.get("close", 0)) for r in rows[max(0, day_idx - 4) : day_idx + 1]) / 5.0
+    buy_price = (next_open + ma5_signal) / 2.0
     if buy_price <= 0:
         return None
 
-    if mode == "hold_3":
-        sell_idx = buy_idx + 2
-        if sell_idx >= len(rows):
-            return None
-        sell_price = _to_float(rows[sell_idx].get("close", 0))
-        if sell_price <= 0:
-            return None
-        return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
-
-    if mode == "hold_5":
-        sell_idx = buy_idx + 4
-        if sell_idx >= len(rows):
-            return None
-        sell_price = _to_float(rows[sell_idx].get("close", 0))
-        if sell_price <= 0:
-            return None
-        return TradeRecord(symbol, rows[buy_idx]["date"], rows[sell_idx]["date"], buy_price, sell_price, sell_price / buy_price - 1, mode)
-
-    # take_profit_stop_loss
-    tp = buy_price * 1.06
+    # 持有3天 + 止盈止损
+    tp = buy_price * 1.05
     sl = buy_price * 0.98
-    last_idx = min(len(rows) - 1, buy_idx + 4)
+    last_idx = min(len(rows) - 1, buy_idx + 2)
 
     for i in range(buy_idx, last_idx + 1):
         day = rows[i]
