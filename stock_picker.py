@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""自动选股系统（资金流 + 热点）
+"""自动选股系统（CSV + AkShare）
 
-支持三种数据源：
-1) csv：从本地 CSV 读取
-2) eastmoney：从东方财富接口拉取行情和资金流
-3) akshare：从 akshare 拉取行情、资金流、热点板块（简化）
-
-兼容：Python 3.12（Windows / Linux / macOS）
+- 保留 csv 模式
+- 新增 akshare 模式（短线 3-5 天模型）
+- 支持每天定时自动输出 TopN 到 picked_stocks.csv
 """
 
 from __future__ import annotations
@@ -83,19 +80,137 @@ def _to_float(row: Dict[str, str], key: str) -> float:
     return float(row.get(key, "0") or 0)
 
 
+def _normalize_ts_code(code: str) -> str:
+    code = str(code).strip()
+    if code.endswith(".SH") or code.endswith(".SZ"):
+        return code
+    return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
+
+
+def _import_akshare() -> Any:
+    try:
+        return importlib.import_module("akshare")
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("未安装 akshare。请执行: pip install akshare pandas") from exc
+
+
+def _df_to_rows(df: Any) -> List[Dict[str, Any]]:
+    if not hasattr(df, "to_dict"):
+        raise TypeError("数据源返回不是 DataFrame")
+    return df.to_dict(orient="records")
+
+
+def _pick(row: Dict[str, Any], keys: List[str], default: Any = 0) -> Any:
+    for k in keys:
+        if k in row and row[k] not in (None, ""):
+            return row[k]
+    return default
+
+
+def _is_excluded_stock(code: str, name: str, close: float, amount: float, pct_chg: float) -> Tuple[bool, str]:
+    name_u = name.upper()
+    if "ST" in name_u or "*ST" in name_u or "退" in name:
+        return True, "st_or_delist"
+    if str(code).startswith("8") or str(code).startswith("4"):
+        return True, "beijing_exchange"
+    if close < 3:
+        return True, "low_price"
+    if amount < 1e8:
+        return True, "low_amount"
+    if pct_chg < -5:
+        return True, "drop_too_much"
+    if pct_chg > 9.5:
+        return True, "chase_limit_up"
+    return False, "normal"
+
+
+def _calc_momentum(close_list: List[float], days: int) -> float:
+    if len(close_list) < days + 1:
+        raise ValueError("历史数据不足")
+    latest = close_list[-1]
+    base = close_list[-(days + 1)]
+    if base == 0:
+        raise ValueError("历史价格为0")
+    return (latest / base - 1.0) * 100.0
+
+
+def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float | str]]:
+    ak = _import_akshare()
+    spot_rows = _df_to_rows(ak.stock_zh_a_spot_em())
+
+    candidates: List[Dict[str, Any]] = []
+    for r in spot_rows:
+        code = str(_pick(r, ["代码", "code"], "")).strip()
+        name = str(_pick(r, ["名称", "name"], "")).strip()
+        if not code or not name:
+            continue
+
+        close = float(_pick(r, ["最新价", "最新", "close"], 0) or 0)
+        pct_chg = float(_pick(r, ["涨跌幅", "pct_chg"], 0) or 0)
+        amount = float(_pick(r, ["成交额", "amount"], 0) or 0)
+
+        excluded, reason = _is_excluded_stock(code, name, close, amount, pct_chg)
+        if excluded:
+            continue
+
+        candidates.append(
+            {
+                "ts_code": _normalize_ts_code(code),
+                "code": code,
+                "name": name,
+                "close": close,
+                "pct_chg": pct_chg,
+                "amount": amount,
+                "risk_flag": reason,
+            }
+        )
+
+    # 先按成交额排序，限制后续历史请求数量，避免接口太慢
+    candidates.sort(key=lambda x: float(x["amount"]), reverse=True)
+    candidates = candidates[: args.ak_hist_limit]
+
+    picked: List[Dict[str, float | str]] = []
+    for c in candidates:
+        try:
+            hist_df = ak.stock_zh_a_hist(symbol=str(c["code"]), period="daily", adjust="qfq")
+            hist_rows = _df_to_rows(hist_df)
+            closes = [float(_pick(h, ["收盘", "close"], 0) or 0) for h in hist_rows if float(_pick(h, ["收盘", "close"], 0) or 0) > 0]
+            momentum_3 = _calc_momentum(closes, 3)
+            momentum_5 = _calc_momentum(closes, 5)
+
+            picked.append(
+                {
+                    "ts_code": c["ts_code"],
+                    "name": c["name"],
+                    "close": c["close"],
+                    "pct_chg": c["pct_chg"],
+                    "amount": c["amount"],
+                    "momentum_3": momentum_3,
+                    "momentum_5": momentum_5,
+                    "risk_flag": "normal",
+                }
+            )
+        except Exception:
+            continue
+
+    liquidity_z = robust_zscores([float(r["amount"]) for r in picked])
+    for idx, r in enumerate(picked):
+        r["liquidity_z"] = liquidity_z[idx]
+        r["total_score"] = (
+            0.35 * float(r["momentum_5"])
+            + 0.25 * float(r["momentum_3"])
+            + 0.25 * float(r["liquidity_z"])
+            + 0.15 * float(r["pct_chg"])
+        )
+
+    picked.sort(key=lambda x: float(x["total_score"]), reverse=True)
+    return picked
+
+
 def _http_get_json(url: str, timeout: int = 12) -> dict:
     req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
     with urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
-
-
-def _normalize_ts_code(code: str) -> str:
-    code = str(code).strip()
-    if not code:
-        return code
-    if code.endswith(".SH") or code.endswith(".SZ"):
-        return code
-    return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
 
 
 def _fetch_eastmoney_market(page_size: int = 200) -> List[Dict[str, str]]:
@@ -164,112 +279,9 @@ def _fetch_eastmoney_flow(page_size: int = 200) -> List[Dict[str, str]]:
     return rows
 
 
-def _import_akshare() -> Any:
-    try:
-        return importlib.import_module("akshare")
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "未安装 akshare。请先执行: pip install akshare pandas"
-        ) from exc
-
-
-def _df_to_rows(df: Any) -> List[Dict[str, Any]]:
-    if hasattr(df, "to_dict"):
-        return df.to_dict(orient="records")
-    raise TypeError("akshare 返回结果不是 DataFrame，无法继续")
-
-
-def _pick_value(row: Dict[str, Any], keys: List[str], default: Any = 0) -> Any:
-    for k in keys:
-        if k in row and row[k] not in (None, ""):
-            return row[k]
-    return default
-
-
-def _fetch_akshare_market(limit: int = 200) -> List[Dict[str, str]]:
-    ak = _import_akshare()
-    spot_df = ak.stock_zh_a_spot_em()
-    records = _df_to_rows(spot_df)[:limit]
-
-    out: List[Dict[str, str]] = []
-    for r in records:
-        code = str(_pick_value(r, ["代码", "code"], "")).strip()
-        if not code:
-            continue
-        out.append(
-            {
-                "ts_code": _normalize_ts_code(code),
-                "name": str(_pick_value(r, ["名称", "name"], "")),
-                "close": str(_pick_value(r, ["最新价", "最新", "close"], 0)),
-                "pct_chg": str(_pick_value(r, ["涨跌幅", "pct_chg"], 0)),
-                "turnover_rate": str(_pick_value(r, ["换手率", "turnover_rate"], 0)),
-                "vol_ratio": str(_pick_value(r, ["量比", "vol_ratio"], 1)),
-            }
-        )
-    return out
-
-
-def _fetch_akshare_flow(limit: int = 200) -> List[Dict[str, str]]:
-    ak = _import_akshare()
-    flow_df = ak.stock_individual_fund_flow_rank(indicator="今日")
-    records = _df_to_rows(flow_df)[:limit]
-
-    out: List[Dict[str, str]] = []
-    for r in records:
-        code = str(_pick_value(r, ["代码", "code"], "")).strip()
-        if not code:
-            continue
-        out.append(
-            {
-                "ts_code": _normalize_ts_code(code),
-                "main_net_inflow": str(_pick_value(r, ["今日主力净流入-净额", "主力净流入", "main_net_inflow"], 0)),
-                "super_net_inflow": str(_pick_value(r, ["今日超大单净流入-净额", "超大单净流入", "super_net_inflow"], 0)),
-                "main_inflow_ratio": str(_pick_value(r, ["今日主力净流入-净占比", "主力净占比", "main_inflow_ratio"], 0)),
-            }
-        )
-    return out
-
-
-def _fetch_akshare_theme(board_top: int = 8, board_cons_limit: int = 40) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
-    """简化热点：取热门行业板块，按排名映射热度，再拉板块成分股作为 theme_map。"""
-    ak = _import_akshare()
-
-    board_df = ak.stock_board_hot_rank_em()
-    boards = _df_to_rows(board_df)[:board_top]
-    if not boards:
-        return [], []
-
-    theme_rows: List[Dict[str, str]] = []
-    theme_map_rows: List[Dict[str, str]] = []
-
-    total = len(boards)
-    for idx, b in enumerate(boards):
-        board_name = str(_pick_value(b, ["板块名称", "名称", "name"], "")).strip()
-        if not board_name:
-            continue
-
-        heat_score = float(total - idx)
-        theme_rows.append({"theme": board_name, "heat_score": str(heat_score)})
-
-        try:
-            cons_df = ak.stock_board_industry_cons_em(symbol=board_name)
-            cons_rows = _df_to_rows(cons_df)[:board_cons_limit]
-            for c in cons_rows:
-                code = str(_pick_value(c, ["代码", "code"], "")).strip()
-                if not code:
-                    continue
-                theme_map_rows.append({"ts_code": _normalize_ts_code(code), "theme": board_name})
-        except Exception:
-            # 某些板块可能接口临时不可用，跳过该板块
-            continue
-
-    return theme_rows, theme_map_rows
-
-
 def build_theme_score(theme_rows: List[Dict[str, str]], theme_map_rows: List[Dict[str, str]]) -> Dict[str, Dict[str, float]]:
     if not theme_rows or not theme_map_rows:
         return {}
-
     theme_heat = {r["theme"]: _to_float(r, "heat_score") for r in theme_rows}
     themes = list(theme_heat.keys())
     zvals = robust_zscores([theme_heat[t] for t in themes])
@@ -282,8 +294,10 @@ def build_theme_score(theme_rows: List[Dict[str, str]], theme_map_rows: List[Dic
     out: Dict[str, Dict[str, float]] = {}
     for ts_code, tlist in stock_themes.items():
         vals = [theme_z.get(t, 0.0) for t in tlist]
-        mean = sum(vals) / len(vals) if vals else 0.0
-        out[ts_code] = {"hot_theme_score": mean, "theme_count": float(len(set(tlist)))}
+        out[ts_code] = {
+            "hot_theme_score": sum(vals) / len(vals) if vals else 0.0,
+            "theme_count": float(len(set(tlist))),
+        }
     return out
 
 
@@ -306,7 +320,6 @@ def score_stocks(
         pct_chg = _to_float(m, "pct_chg")
         vol_ratio = _to_float(m, "vol_ratio")
         turnover_rate = _to_float(m, "turnover_rate")
-
         main_net_inflow = _to_float(f, "main_net_inflow")
         super_net_inflow = _to_float(f, "super_net_inflow")
         main_inflow_ratio = _to_float(f, "main_inflow_ratio")
@@ -316,7 +329,6 @@ def score_stocks(
         liquidity_raw = 0.6 * turnover_rate + 0.4 * vol_ratio
 
         t = theme_score.get(ts_code, {"hot_theme_score": 0.0, "theme_count": 0.0})
-
         records.append(
             {
                 "ts_code": ts_code,
@@ -331,6 +343,7 @@ def score_stocks(
                 "liquidity_raw": liquidity_raw,
                 "hot_theme_score": t["hot_theme_score"],
                 "turnover_rate": turnover_rate,
+                "risk_flag": "normal",
             }
         )
 
@@ -339,21 +352,12 @@ def score_stocks(
     liq_z = robust_zscores([r["liquidity_raw"] for r in records])
 
     for idx, r in enumerate(records):
-        r["money_flow_z"] = flow_z[idx]
-        r["momentum_z"] = momentum_z[idx]
-        r["liquidity_z"] = liq_z[idx]
         r["total_score"] = (
-            weights.money_flow * r["money_flow_z"]
-            + weights.momentum * r["momentum_z"]
-            + weights.liquidity * r["liquidity_z"]
-            + weights.hot_theme * r["hot_theme_score"]
+            weights.money_flow * flow_z[idx]
+            + weights.momentum * momentum_z[idx]
+            + weights.liquidity * liq_z[idx]
+            + weights.hot_theme * float(r["hot_theme_score"])
         )
-        risk_flag = "normal"
-        if float(r["turnover_rate"]) > 25:
-            risk_flag = "high_turnover"
-        if float(r["pct_chg"]) > 9:
-            risk_flag = "limit_up_nearby"
-        r["risk_flag"] = risk_flag
 
     records.sort(key=lambda x: float(x["total_score"]), reverse=True)
     return records
@@ -361,22 +365,21 @@ def score_stocks(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="资金流+热点自动选股")
-    parser.add_argument("--source", choices=["csv", "eastmoney", "akshare"], default="csv", help="数据源：csv/eastmoney/akshare")
-    parser.add_argument("--market", type=Path, help="行情 CSV（source=csv 时必填）")
-    parser.add_argument("--flow", type=Path, help="资金流 CSV（source=csv 时必填）")
-    parser.add_argument("--theme", type=Path, help="题材热度 CSV（可选）")
-    parser.add_argument("--theme-map", type=Path, help="个股题材映射 CSV（可选）")
+    parser.add_argument("--source", choices=["csv", "eastmoney", "akshare"], default="csv")
+    parser.add_argument("--market", type=Path, help="csv模式行情文件")
+    parser.add_argument("--flow", type=Path, help="csv模式资金流文件")
+    parser.add_argument("--theme", type=Path, help="csv模式题材文件")
+    parser.add_argument("--theme-map", type=Path, help="csv模式题材映射")
 
-    parser.add_argument("--em-page-size", type=int, default=200, help="东方财富拉取股票数")
-    parser.add_argument("--ak-limit", type=int, default=200, help="akshare 拉取股票数")
-    parser.add_argument("--ak-board-top", type=int, default=8, help="akshare 热点板块数量")
-    parser.add_argument("--ak-board-cons-limit", type=int, default=40, help="每个板块最多成分股数量")
+    parser.add_argument("--em-page-size", type=int, default=200)
 
-    parser.add_argument("--top", type=int, default=3, help="输出前 N 只股票，默认3")
-    parser.add_argument("--output", type=Path, default=Path("picked_stocks.csv"), help="输出 CSV 路径")
+    parser.add_argument("--ak-hist-limit", type=int, default=150, help="akshare模式参与3/5日计算的股票上限")
 
-    parser.add_argument("--auto-daily", action="store_true", help="开启每天自动筛选")
-    parser.add_argument("--daily-time", default="15:10", help="每天执行时间 HH:MM，默认 15:10")
+    parser.add_argument("--top", type=int, default=3)
+    parser.add_argument("--output", type=Path, default=Path("picked_stocks.csv"))
+
+    parser.add_argument("--auto-daily", action="store_true")
+    parser.add_argument("--daily-time", default="15:10")
 
     parser.add_argument("--w-money-flow", type=float, default=0.45)
     parser.add_argument("--w-momentum", type=float, default=0.25)
@@ -395,14 +398,11 @@ def build_weights(args: argparse.Namespace) -> FactorWeights:
 
 def _load_theme_optional(args: argparse.Namespace) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
     if args.theme and args.theme_map:
-        return (
-            read_csv(args.theme, REQUIRED_THEME_COLUMNS, "theme"),
-            read_csv(args.theme_map, REQUIRED_THEME_MAP_COLUMNS, "theme_map"),
-        )
+        return read_csv(args.theme, REQUIRED_THEME_COLUMNS, "theme"), read_csv(args.theme_map, REQUIRED_THEME_MAP_COLUMNS, "theme_map")
     return [], []
 
 
-def load_data(args: argparse.Namespace) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
+def _load_legacy_data(args: argparse.Namespace) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
     if args.source == "csv":
         if not args.market or not args.flow:
             raise ValueError("source=csv 时必须提供 --market 和 --flow")
@@ -411,55 +411,38 @@ def load_data(args: argparse.Namespace) -> Tuple[List[Dict[str, str]], List[Dict
         theme, theme_map = _load_theme_optional(args)
         return market, flow, theme, theme_map
 
-    if args.source == "eastmoney":
-        market = _fetch_eastmoney_market(args.em_page_size)
-        flow = _fetch_eastmoney_flow(args.em_page_size)
-        theme, theme_map = _load_theme_optional(args)
-        return market, flow, theme, theme_map
-
-    market = _fetch_akshare_market(args.ak_limit)
-    flow = _fetch_akshare_flow(args.ak_limit)
-
-    # akshare 模式：优先本地题材；若未提供则自动生成简化热点板块映射
+    market = _fetch_eastmoney_market(args.em_page_size)
+    flow = _fetch_eastmoney_flow(args.em_page_size)
     theme, theme_map = _load_theme_optional(args)
-    if not theme or not theme_map:
-        theme, theme_map = _fetch_akshare_theme(board_top=args.ak_board_top, board_cons_limit=args.ak_board_cons_limit)
     return market, flow, theme, theme_map
 
 
-def write_output(rows: List[Dict[str, float | str]], path: Path, topn: int) -> None:
+def write_output(rows: List[Dict[str, float | str]], path: Path, topn: int, source: str) -> None:
     selected = rows[:topn]
-    columns = [
-        "ts_code",
-        "name",
-        "close",
-        "pct_chg",
-        "main_net_inflow",
-        "main_inflow_ratio",
-        "theme_count",
-        "money_flow_z",
-        "momentum_z",
-        "liquidity_z",
-        "hot_theme_score",
-        "total_score",
-        "risk_flag",
-    ]
+    if source == "akshare":
+        columns = ["ts_code", "name", "close", "pct_chg", "amount", "momentum_3", "momentum_5", "total_score", "risk_flag"]
+    else:
+        columns = ["ts_code", "name", "close", "pct_chg", "total_score", "risk_flag"]
+
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         for r in selected:
-            writer.writerow({k: r[k] for k in columns})
+            writer.writerow({k: r.get(k, "") for k in columns})
 
     print("=== Top Picks ===")
     for r in selected:
-        print(f"{r['ts_code']:>10} {r['name']:<10} score={float(r['total_score']):.4f} risk={r['risk_flag']}")
+        print(f"{r.get('ts_code',''):>10} {str(r.get('name','')):<10} score={float(r.get('total_score',0)):.4f} risk={r.get('risk_flag','normal')}")
     print(f"\n已输出到: {path}")
 
 
 def run_once(args: argparse.Namespace, weights: FactorWeights) -> None:
-    market, flow, theme, theme_map = load_data(args)
-    rows = score_stocks(market, flow, theme, theme_map, weights)
-    write_output(rows, args.output, args.top)
+    if args.source == "akshare":
+        rows = _fetch_akshare_short_term(args)
+    else:
+        market, flow, theme, theme_map = _load_legacy_data(args)
+        rows = score_stocks(market, flow, theme, theme_map, weights)
+    write_output(rows, args.output, args.top, args.source)
 
 
 def _next_run_time(daily_time: str) -> datetime:
@@ -467,19 +450,18 @@ def _next_run_time(daily_time: str) -> datetime:
         hh, mm = daily_time.split(":")
         target = datetime.now().replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
     except Exception as exc:
-        raise ValueError("--daily-time 格式错误，必须是 HH:MM，例如 15:10") from exc
-
+        raise ValueError("--daily-time 必须是 HH:MM，例如 15:10") from exc
     if target <= datetime.now():
         target = target + timedelta(days=1)
     return target
 
 
 def run_daily(args: argparse.Namespace, weights: FactorWeights) -> None:
-    print(f"已开启每日自动选股，执行时间: {args.daily_time}，Top={args.top}")
+    print(f"已开启每日自动选股：{args.daily_time}，Top={args.top}")
     while True:
         nxt = _next_run_time(args.daily_time)
         wait_seconds = max(1, int((nxt - datetime.now()).total_seconds()))
-        print(f"下一次运行时间: {nxt.strftime('%Y-%m-%d %H:%M:%S')}，等待 {wait_seconds} 秒")
+        print(f"下一次运行: {nxt.strftime('%Y-%m-%d %H:%M:%S')}，等待 {wait_seconds} 秒")
         time.sleep(wait_seconds)
         try:
             run_once(args, weights)
@@ -490,7 +472,6 @@ def run_daily(args: argparse.Namespace, weights: FactorWeights) -> None:
 def main() -> None:
     args = parse_args()
     weights = build_weights(args)
-
     if args.auto_daily:
         run_daily(args, weights)
     else:

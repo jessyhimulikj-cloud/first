@@ -1,47 +1,37 @@
-# 自动选股系统（资金流 + 热点）
+# 自动选股系统（CSV + AkShare）
 
-这是一个可落地的 **自动选股打分脚本**，支持三种数据源：
+本项目提供一个可运行的自动选股脚本：
 
-- `csv`：本地 CSV 数据
-- `eastmoney`：东方财富实时接口（行情 + 资金流）
-- `akshare`：akshare 行情 + 资金流 + 热点板块（简化）
-
-核心融合因子：
-- 资金流（主力净流入、超大单净流入、主力流入占比）
-- 动量（涨跌幅、量比）
-- 流动性（换手率、量比）
-- 热点题材热度（题材热度 + 个股题材映射）
-
-> 说明：本项目是策略研究与工程模板，不构成投资建议。
+- 保留 `csv` 模式（兼容旧数据流程）
+- 新增 `akshare` 模式（真实 A 股行情 + 短线 3-5 天评分）
+- 输出 `picked_stocks.csv`
+- 支持每天自动筛选 Top3
 
 ---
 
-## 1. 环境要求
+## 1. 环境（Windows + Python 3.12）
 
-- Python `3.12`（Windows / Linux / macOS）
-- 推荐先创建虚拟环境
-
-### Windows（PowerShell）
+### Windows PowerShell
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install pytest akshare pandas
+pip install akshare pandas pytest
 ```
 
-### Linux / macOS
+### Linux/macOS
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install pytest akshare pandas
+pip install akshare pandas pytest
 ```
 
 ---
 
-## 2. 快速开始
+## 2. 运行命令
 
-### 方式 A：CSV
+## 2.1 CSV 模式（保留）
 
 ```bash
 python stock_picker.py \
@@ -54,33 +44,17 @@ python stock_picker.py \
   --output picked_stocks.csv
 ```
 
-### 方式 B：东方财富
-
-```bash
-python stock_picker.py \
-  --source eastmoney \
-  --em-page-size 200 \
-  --top 3 \
-  --output picked_stocks.csv
-```
-
-### 方式 C：akshare（推荐）
+## 2.2 AkShare 模式（新）
 
 ```bash
 python stock_picker.py \
   --source akshare \
-  --ak-limit 200 \
-  --ak-board-top 8 \
-  --ak-board-cons-limit 40 \
+  --ak-hist-limit 150 \
   --top 3 \
   --output picked_stocks.csv
 ```
 
-> `akshare` 模式下如果不传 `--theme` / `--theme-map`，程序会自动构造“简化热点板块映射”。
-
----
-
-## 3. 每天自动筛选 Top3
+## 2.3 每天自动筛选 Top3
 
 ```bash
 python stock_picker.py \
@@ -91,60 +65,36 @@ python stock_picker.py \
   --output picked_stocks.csv
 ```
 
-说明：
-- 每天到 `15:10` 自动执行一次
-- 结果会覆盖写入 `picked_stocks.csv`
+---
+
+## 3. AkShare 模式策略逻辑（简化可运行版）
+
+### 数据来源
+- A 股实时行情列表：`stock_zh_a_spot_em`
+- 个股历史日线（用于 3/5 日涨幅）：`stock_zh_a_hist`
+
+### 风险过滤
+- 剔除 ST / 退市
+- 剔除北交所（代码 8/4 开头）
+- 剔除价格 < 3 元
+- 剔除成交额 < 1 亿
+- 剔除跌幅 < -5%
+- 剔除涨幅 > 9.5%
+
+### 指标与评分
+- `momentum_5`：5 日涨幅
+- `momentum_3`：3 日涨幅
+- `liquidity_z`：成交额的 z 分数
+- `pct_chg`：今日涨跌幅
+
+`total_score = momentum_5 * 0.35 + momentum_3 * 0.25 + liquidity_z * 0.25 + pct_chg * 0.15`
+
+### 输出字段
+- `ts_code, name, close, pct_chg, amount, momentum_3, momentum_5, total_score, risk_flag`
 
 ---
 
-## 4. 输入数据格式（CSV 模式）
-
-### `market.csv`
-必需字段：
-- `ts_code` 股票代码（如 `000001.SZ`）
-- `name` 股票名称
-- `close` 收盘价
-- `pct_chg` 当日涨跌幅（%）
-- `vol_ratio` 量比
-- `turnover_rate` 换手率（%）
-
-### `flow.csv`
-必需字段：
-- `ts_code`
-- `main_net_inflow` 主力净流入
-- `super_net_inflow` 超大单净流入
-- `main_inflow_ratio` 主力流入占比（%）
-
-### `theme.csv`
-必需字段：
-- `theme` 题材名称
-- `heat_score` 题材热度分
-
-### `theme_map.csv`
-必需字段：
-- `ts_code`
-- `theme`
-
----
-
-## 5. 命令行参数
-
-- `--source`：`csv` / `eastmoney` / `akshare`
-- `--market`、`--flow`：CSV 模式必填
-- `--theme`、`--theme-map`：可选
-- `--em-page-size`：东方财富拉取股票数
-- `--ak-limit`：akshare 拉取股票数
-- `--ak-board-top`：akshare 热点板块数量
-- `--ak-board-cons-limit`：每个热点板块的成分股上限
-- `--top`：输出前 N 只股票（默认 3）
-- `--output`：输出文件，默认 `picked_stocks.csv`
-- `--auto-daily`：开启每日自动运行
-- `--daily-time`：每日运行时间 `HH:MM`
-- 四个权重参数：`--w-money-flow`、`--w-momentum`、`--w-liquidity`、`--w-hot-theme`
-
----
-
-## 6. 测试
+## 4. 测试
 
 ```bash
 pytest -q
