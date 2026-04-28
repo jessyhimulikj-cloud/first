@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -122,8 +123,30 @@ def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> L
             return [r for r in norm_rows if start <= r["date"] <= end]
 
     ak = _import_akshare()
+    symbol6 = re.sub(r"\D", "", str(symbol))[:6]
+    start_date = str(start)
+    end_date = str(end)
+    if len(symbol6) != 6:
+        print(f"[history] {symbol} 原始df.shape=(0, 0) 原始columns=[]")
+        return []
+
     try:
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start, end_date=end, adjust="qfq")
+        print(f"fetch hist: symbol={symbol6}, start={start_date}, end={end_date}")
+        df = ak.stock_zh_a_hist(
+            symbol=symbol6,
+            period="daily",
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq",
+        )
+        if getattr(df, "empty", False):
+            df = ak.stock_zh_a_hist(
+                symbol=symbol6,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="",
+            )
         rows = _df_to_rows(df)
         print(f"[history] {symbol} 原始df.shape={getattr(df, 'shape', ('?', '?'))} 原始columns={list(getattr(df, 'columns', []))}")
     except Exception:
