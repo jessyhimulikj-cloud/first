@@ -92,58 +92,52 @@ def load_universe(cache_dir: Path, size: int = 50) -> List[str]:
 
 
 def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> List[Dict[str, Any]]:
+    def _normalize_history_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        norm_rows: List[Dict[str, Any]] = []
+        for r in rows:
+            date_raw = r.get("date", r.get("日期", ""))
+            d = str(date_raw).replace("-", "").strip()
+            if not d:
+                continue
+            norm_rows.append(
+                {
+                    "date": d,
+                    "open": _to_float(r.get("open", r.get("开盘", 0))),
+                    "high": _to_float(r.get("high", r.get("最高", 0))),
+                    "low": _to_float(r.get("low", r.get("最低", 0))),
+                    "close": _to_float(r.get("close", r.get("收盘", 0))),
+                    "volume": _to_float(r.get("volume", r.get("成交量", 0))),
+                    "amount": _to_float(r.get("amount", r.get("成交额", 0))),
+                    "pct_chg": _to_float(r.get("pct_chg", r.get("涨跌幅", 0))),
+                }
+            )
+        return norm_rows
+
     cache_file = _cache_path(cache_dir, symbol)
     if cache_file.exists():
         with cache_file.open("r", encoding="utf-8", newline="") as f:
             rows = list(csv.DictReader(f))
-            out: List[Dict[str, Any]] = []
-            for r in rows:
-                d = str(r.get("date", "")).replace("-", "")
-                if not d or not (start <= d <= end):
-                    continue
-                out.append(
-                    {
-                        "date": d,
-                        "open": _to_float(r.get("open", 0)),
-                        "high": _to_float(r.get("high", 0)),
-                        "low": _to_float(r.get("low", 0)),
-                        "close": _to_float(r.get("close", 0)),
-                        "pct_chg": _to_float(r.get("pct_chg", 0)),
-                        "amount": _to_float(r.get("amount", 0)),
-                    }
-                )
-            return out
+            print(f"[history] {symbol} 原始df.shape=({len(rows)}, {len(rows[0]) if rows else 0}) 原始columns={list(rows[0].keys()) if rows else []}")
+            norm_rows = _normalize_history_rows(rows)
+            return [r for r in norm_rows if start <= r["date"] <= end]
 
     ak = _import_akshare()
     try:
         df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start, end_date=end, adjust="qfq")
         rows = _df_to_rows(df)
+        print(f"[history] {symbol} 原始df.shape={getattr(df, 'shape', ('?', '?'))} 原始columns={list(getattr(df, 'columns', []))}")
     except Exception:
+        print(f"[history] {symbol} 原始df.shape=(0, 0) 原始columns=[]")
         return []
 
-    norm_rows: List[Dict[str, Any]] = []
-    for r in rows:
-        d = str(r.get("日期", "")).replace("-", "")
-        if not d:
-            continue
-        norm_rows.append(
-            {
-                "date": d,
-                "open": _to_float(r.get("开盘", 0)),
-                "high": _to_float(r.get("最高", 0)),
-                "low": _to_float(r.get("最低", 0)),
-                "close": _to_float(r.get("收盘", 0)),
-                "pct_chg": _to_float(r.get("涨跌幅", 0)),
-                "amount": _to_float(r.get("成交额", 0)),
-            }
-        )
+    norm_rows = _normalize_history_rows(rows)
 
     with cache_file.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "open", "high", "low", "close", "pct_chg", "amount"])
+        writer = csv.DictWriter(f, fieldnames=["date", "open", "high", "low", "close", "volume", "amount", "pct_chg"])
         writer.writeheader()
         writer.writerows(norm_rows)
 
-    return norm_rows
+    return [r for r in norm_rows if start <= r["date"] <= end]
 
 
 def load_hs300_history(start: str, end: str, cache_dir: Path) -> List[Dict[str, Any]]:
@@ -519,12 +513,23 @@ def main() -> None:
 
     print("[2/5] 加载历史数据（带缓存）...")
     universe_data: Dict[str, List[Dict[str, Any]]] = {}
+    success_symbols: List[str] = []
+    failed_symbols: List[str] = []
     for i, symbol in enumerate(universe, start=1):
         rows = load_symbol_history(symbol, start, end, args.cache_dir)
-        if rows:
+        required_cols = {"date", "open", "high", "low", "close"}
+        has_required = bool(rows) and required_cols.issubset(rows[0].keys())
+        if has_required:
             universe_data[symbol] = rows
+            success_symbols.append(symbol)
+        else:
+            failed_symbols.append(symbol)
         if i % 10 == 0:
             print(f"  已加载 {i}/{len(universe)}")
+
+    print(f"成功加载股票数: {len(success_symbols)}")
+    print(f"失败股票数: {len(failed_symbols)}")
+    print(f"前3个成功股票代码: {success_symbols[:3]}")
 
     if not universe_data:
         raise RuntimeError("无可用历史数据，请检查网络或 akshare")
