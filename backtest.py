@@ -211,6 +211,29 @@ def build_hs300_filter(index_rows: List[Dict[str, Any]], confirm_days: int = 3) 
     return allow
 
 
+def align_regime_filter_to_trade_days(trade_days: List[str], index_allow: Dict[str, bool]) -> Dict[str, bool]:
+    """
+    将指数过滤结果对齐到个股交易日。
+    返回 date -> allow（True 可交易 / False 不可交易）。
+    规则：若当天指数无数据，沿用最近一个已知交易日的状态。
+    """
+    if not trade_days:
+        return {}
+    if not index_allow:
+        return {d: True for d in trade_days}
+
+    aligned: Dict[str, bool] = {}
+    known_days = sorted(index_allow.keys())
+    j = 0
+    last_allow = True
+    for day in sorted(trade_days):
+        while j < len(known_days) and known_days[j] <= day:
+            last_allow = index_allow[known_days[j]]
+            j += 1
+        aligned[day] = last_allow
+    return aligned
+
+
 def momentum(closes: List[float], days: int) -> float:
     if len(closes) < days + 1:
         raise ValueError("历史不足")
@@ -513,6 +536,7 @@ def main() -> None:
     print("[3.5/5] 加载沪深300环境过滤...")
     hs300_rows = load_hs300_history(start, end, args.cache_dir)
     hs300_allow = build_hs300_filter(hs300_rows, confirm_days=args.regime_confirm_days)
+    aligned_hs300_allow = align_regime_filter_to_trade_days(trading_days, hs300_allow)
 
     # 名称映射（用实时快照，失败则用代码）
     name_map: Dict[str, str] = {}
@@ -528,8 +552,15 @@ def main() -> None:
     mode_trades: Dict[str, List[TradeRecord]] = {m: [] for m in modes}
 
     trade_days = trading_days[-args.max_days :] if args.max_days > 0 else trading_days
+    skipped_bear_days = 0
+
+    def is_bear_market(day: str) -> bool:
+        return not aligned_hs300_allow.get(day, True)
+
     for idx, day in enumerate(trade_days[:-6]):
-        if hs300_allow and not hs300_allow.get(day, True):
+        if is_bear_market(day):
+            print(f"{day} 跳过（弱势市场）")
+            skipped_bear_days += 1
             continue
         symbol = pick_stock_for_day(day, universe_data, name_map)
         if not symbol:
@@ -552,6 +583,7 @@ def main() -> None:
             print(f"  回测进度: {idx}/{len(trade_days)}")
 
     print("[5/5] 统计并输出...")
+    print(f"弱势市场跳过交易日: {skipped_bear_days}")
     mode_to_metrics = {m: calc_metrics(ts) for m, ts in mode_trades.items()}
     save_result(args.output, mode_to_metrics)
 
