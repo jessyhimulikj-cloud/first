@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -58,6 +60,23 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 
 def _cache_path(cache_dir: Path, symbol: str) -> Path:
     return cache_dir / f"{symbol}.csv"
+
+
+def _em_symbol(symbol: str) -> str:
+    symbol6 = re.sub(r"\D", "", str(symbol))[:6]
+    if len(symbol6) != 6:
+        return ""
+    if symbol6.startswith("6"):
+        return f"1.{symbol6}"
+    return f"0.{symbol6}"
+
+
+def _em_session() -> Any:
+    requests = importlib.import_module("requests")
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+    return session
 
 
 def load_universe(cache_dir: Path, size: int = 50) -> List[str]:
@@ -122,7 +141,6 @@ def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> L
             norm_rows = _normalize_history_rows(rows)
             return [r for r in norm_rows if start <= r["date"] <= end]
 
-    ak = _import_akshare()
     symbol6 = re.sub(r"\D", "", str(symbol))[:6]
     start_date = str(start)
     end_date = str(end)
@@ -131,24 +149,48 @@ def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> L
         return []
 
     try:
+        em_secid = _em_symbol(symbol6)
+        if not em_secid:
+            return []
         print(f"fetch hist: symbol={symbol6}, start={start_date}, end={end_date}")
-        df = ak.stock_zh_a_hist(
-            symbol=symbol6,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",
+        session = _em_session()
+        time.sleep(0.1)
+        resp = session.get(
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={
+                "secid": em_secid,
+                "klt": "101",
+                "fqt": "1",
+                "beg": start_date,
+                "end": end_date,
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            },
+            timeout=15,
         )
-        if getattr(df, "empty", False):
-            df = ak.stock_zh_a_hist(
-                symbol=symbol6,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="",
+        resp.raise_for_status()
+        payload = resp.json() if "application/json" in resp.headers.get("Content-Type", "") else json.loads(resp.text)
+        klines = (((payload or {}).get("data") or {}).get("klines")) or []
+        rows: List[Dict[str, Any]] = []
+        for line in klines:
+            # date, open, close, high, low, volume, amount, amplitude, pct_chg, change, turnover
+            parts = str(line).split(",")
+            if len(parts) < 9:
+                continue
+            rows.append(
+                {
+                    "date": parts[0],
+                    "open": parts[1],
+                    "close": parts[2],
+                    "high": parts[3],
+                    "low": parts[4],
+                    "volume": parts[5],
+                    "amount": parts[6],
+                    "pct_chg": parts[8],
+                }
             )
-        rows = _df_to_rows(df)
-        print(f"[history] {symbol} 原始df.shape={getattr(df, 'shape', ('?', '?'))} 原始columns={list(getattr(df, 'columns', []))}")
+        print(f"[history] {symbol} 原始df.shape=({len(rows)}, 8) 原始columns={['date','open','close','high','low','volume','amount','pct_chg']}")
     except Exception:
         print(f"[history] {symbol} 原始df.shape=(0, 0) 原始columns=[]")
         return []
