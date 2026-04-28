@@ -311,27 +311,78 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, 
     if buy_price <= 0:
         return None
 
-    # 持有3天 + 止盈止损
-    tp = buy_price * 1.05
+    # 新卖出策略：分段止盈 + 趋势持有 + 移动止盈，最多持有5天
+    tp_partial = buy_price * 1.04
     sl = buy_price * 0.98
-    last_idx = min(len(rows) - 1, buy_idx + 2)
+    last_idx = min(len(rows) - 1, buy_idx + 4)
+
+    position = 1.0
+    realized_gross = 0.0
+    partial_done = False
+    trail_armed = False
+    peak_price = buy_price
+    sell_date = rows[last_idx]["date"]
+    final_sell_price = _to_float(rows[last_idx].get("close", 0))
 
     for i in range(buy_idx, last_idx + 1):
         day = rows[i]
         low = _to_float(day.get("low", 0))
         high = _to_float(day.get("high", 0))
-        if low > 0 and low <= sl:
-            ret = _apply_cost(sl / buy_price - 1, fee_rate, slippage)
-            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, sl, ret, mode)
-        if high > 0 and high >= tp:
-            ret = _apply_cost(tp / buy_price - 1, fee_rate, slippage)
-            return TradeRecord(symbol, rows[buy_idx]["date"], day["date"], buy_price, tp, ret, mode)
+        close_i = _to_float(day.get("close", 0))
+        if high > peak_price:
+            peak_price = high
 
-    sell_price = _to_float(rows[last_idx].get("close", 0))
-    if sell_price <= 0:
+        # 止损：-2%，优先级最高
+        if position > 0 and low > 0 and low <= sl:
+            realized_gross += position * (sl / buy_price - 1)
+            position = 0.0
+            sell_date = day["date"]
+            final_sell_price = sl
+            break
+
+        # 分段止盈：+4% 先卖 50%
+        if position > 0 and (not partial_done) and high > 0 and high >= tp_partial:
+            realized_gross += 0.5 * (tp_partial / buy_price - 1)
+            position -= 0.5
+            partial_done = True
+            sell_date = day["date"]
+
+        # 盈利超过3%后，启用移动止盈（从高点回撤2%）
+        if close_i >= buy_price * 1.03:
+            trail_armed = True
+        if position > 0 and trail_armed and peak_price > 0 and close_i > 0:
+            drawdown_from_peak = (peak_price - close_i) / peak_price
+            if drawdown_from_peak >= 0.02:
+                realized_gross += position * (close_i / buy_price - 1)
+                position = 0.0
+                sell_date = day["date"]
+                final_sell_price = close_i
+                break
+
+        # 趋势持有：趋势未破不提前卖；若跌破 MA5 则卖剩余仓位
+        if position > 0:
+            window = rows[max(0, i - 4) : i + 1]
+            ma5_now = sum(_to_float(x.get("close", 0)) for x in window) / 5.0
+            if close_i > 0 and close_i < ma5_now:
+                realized_gross += position * (close_i / buy_price - 1)
+                position = 0.0
+                sell_date = day["date"]
+                final_sell_price = close_i
+                break
+
+    if position > 0:
+        if final_sell_price <= 0:
+            final_sell_price = _to_float(rows[last_idx].get("close", 0))
+        if final_sell_price <= 0:
+            return None
+        realized_gross += position * (final_sell_price / buy_price - 1)
+        position = 0.0
+        sell_date = rows[last_idx]["date"]
+
+    ret = _apply_cost(realized_gross, fee_rate, slippage)
+    if final_sell_price <= 0:
         return None
-    ret = _apply_cost(sell_price / buy_price - 1, fee_rate, slippage)
-    return TradeRecord(symbol, rows[buy_idx]["date"], rows[last_idx]["date"], buy_price, sell_price, ret, mode)
+    return TradeRecord(symbol, rows[buy_idx]["date"], sell_date, buy_price, final_sell_price, ret, mode)
 
 
 def max_drawdown(returns: List[float]) -> float:
