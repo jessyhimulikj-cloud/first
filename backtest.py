@@ -182,20 +182,32 @@ def load_hs300_history(start: str, end: str, cache_dir: Path) -> List[Dict[str, 
     return [r for r in out if start <= r["date"] <= end]
 
 
-def build_hs300_filter(index_rows: List[Dict[str, Any]]) -> Dict[str, bool]:
-    """返回 date -> 是否允许交易（close >= ma20）。"""
+def build_hs300_filter(index_rows: List[Dict[str, Any]], confirm_days: int = 3) -> Dict[str, bool]:
+    """
+    返回 date -> 是否允许交易。
+    规则：
+    - 弱势定义：close < ma20
+    - 若连续 confirm_days 天弱势，则判定为空仓（当天不交易）
+    """
     if not index_rows:
         return {}
     rows = sorted(index_rows, key=lambda x: x["date"])
     allow: Dict[str, bool] = {}
     closes: List[float] = []
+    weak_flags: List[bool] = []
     for r in rows:
         closes.append(float(r["close"]))
         if len(closes) < 20:
             allow[r["date"]] = True
         else:
             ma20 = sum(closes[-20:]) / 20.0
-            allow[r["date"]] = float(r["close"]) >= ma20
+            weak_today = float(r["close"]) < ma20
+            weak_flags.append(weak_today)
+            if confirm_days <= 1:
+                allow[r["date"]] = not weak_today
+            else:
+                recent = weak_flags[-confirm_days:]
+                allow[r["date"]] = not (len(recent) == confirm_days and all(recent))
     return allow
 
 
@@ -458,6 +470,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-days", type=int, default=60, help="max trading days")
     parser.add_argument("--fee-rate", type=float, default=0.003, help="transaction fee")
     parser.add_argument("--slippage", type=float, default=0.001, help="slippage")
+    parser.add_argument("--regime-confirm-days", type=int, default=3, help="regime weak confirmation days")
     parser.add_argument("--modes", nargs="+", default=["hold_3"], choices=["hold_3", "hold_5", "take_profit_stop_loss"], help="sell mode")
     parser.add_argument("--limit-300", action="store_true", help="use hs300 universe")
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache_backtest"), help="cache folder")
@@ -499,7 +512,7 @@ def main() -> None:
 
     print("[3.5/5] 加载沪深300环境过滤...")
     hs300_rows = load_hs300_history(start, end, args.cache_dir)
-    hs300_allow = build_hs300_filter(hs300_rows)
+    hs300_allow = build_hs300_filter(hs300_rows, confirm_days=args.regime_confirm_days)
 
     # 名称映射（用实时快照，失败则用代码）
     name_map: Dict[str, str] = {}
@@ -516,10 +529,10 @@ def main() -> None:
 
     trade_days = trading_days[-args.max_days :] if args.max_days > 0 else trading_days
     for idx, day in enumerate(trade_days[:-6]):
+        if hs300_allow and not hs300_allow.get(day, True):
+            continue
         symbol = pick_stock_for_day(day, universe_data, name_map)
         if not symbol:
-            continue
-        if hs300_allow and not hs300_allow.get(day, True):
             continue
 
         rows = universe_data.get(symbol, [])
