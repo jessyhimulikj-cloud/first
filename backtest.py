@@ -36,6 +36,7 @@ class TradeRecord:
     sell_price: float
     ret: float
     mode: str
+    exit_reason: str = "other"
 
 
 def _import_akshare() -> Any:
@@ -405,6 +406,41 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, 
     if buy_price <= 0:
         return None
 
+    if mode == "tp5_sl3_hold3":
+        tp_price = buy_price * 1.05
+        sl_price = buy_price * 0.97
+        last_idx = min(len(rows) - 1, buy_idx + 2)  # 最多持有3天（含买入日）
+        sell_date = rows[last_idx]["date"]
+        sell_price = _to_float(rows[last_idx].get("close", 0))
+        exit_reason = "timeout_exit"
+
+        for i in range(buy_idx, last_idx + 1):
+            day = rows[i]
+            high = _to_float(day.get("high", 0))
+            low = _to_float(day.get("low", 0))
+            close_i = _to_float(day.get("close", 0))
+
+            if high > 0 and high >= tp_price:
+                sell_date = day["date"]
+                sell_price = tp_price
+                exit_reason = "stop_profit"
+                break
+            if low > 0 and low <= sl_price:
+                sell_date = day["date"]
+                sell_price = sl_price
+                exit_reason = "stop_loss"
+                break
+
+            if i == last_idx and close_i > 0:
+                sell_date = day["date"]
+                sell_price = close_i
+                exit_reason = "timeout_exit"
+
+        if sell_price <= 0:
+            return None
+        ret = _apply_cost((sell_price / buy_price - 1.0), fee_rate, slippage)
+        return TradeRecord(symbol, rows[buy_idx]["date"], sell_date, buy_price, sell_price, ret, mode, exit_reason)
+
     # 新卖出策略：分段止盈 + 趋势持有 + 移动止盈，最多持有5天
     tp_partial = buy_price * 1.04
     sl = buy_price * 0.98
@@ -476,7 +512,7 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, 
     ret = _apply_cost(realized_gross, fee_rate, slippage)
     if final_sell_price <= 0:
         return None
-    return TradeRecord(symbol, rows[buy_idx]["date"], sell_date, buy_price, final_sell_price, ret, mode)
+    return TradeRecord(symbol, rows[buy_idx]["date"], sell_date, buy_price, final_sell_price, ret, mode, "other")
 
 
 def max_drawdown(returns: List[float]) -> float:
@@ -501,6 +537,11 @@ def calc_metrics(trades: List[TradeRecord]) -> Dict[str, Any]:
             "avg_return": 0.0,
             "max_drawdown": 0.0,
             "profit_loss_ratio": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "stop_profit_count": 0,
+            "stop_loss_count": 0,
+            "timeout_exit_count": 0,
             "annual_returns": {},
         }
 
@@ -517,6 +558,9 @@ def calc_metrics(trades: List[TradeRecord]) -> Dict[str, Any]:
     avg_gain = sum(wins) / len(wins) if wins else 0.0
     avg_loss = sum(losses) / len(losses) if losses else 0.0
     pl_ratio = (avg_gain / abs(avg_loss)) if avg_loss != 0 else 0.0
+    stop_profit_count = sum(1 for t in trades if t.exit_reason == "stop_profit")
+    stop_loss_count = sum(1 for t in trades if t.exit_reason == "stop_loss")
+    timeout_exit_count = sum(1 for t in trades if t.exit_reason == "timeout_exit")
 
     return {
         "total_trades": len(trades),
@@ -524,6 +568,11 @@ def calc_metrics(trades: List[TradeRecord]) -> Dict[str, Any]:
         "avg_return": sum(rets) / len(rets),
         "max_drawdown": max_drawdown(rets),
         "profit_loss_ratio": pl_ratio,
+        "avg_win": avg_gain,
+        "avg_loss": avg_loss,
+        "stop_profit_count": stop_profit_count,
+        "stop_loss_count": stop_loss_count,
+        "timeout_exit_count": timeout_exit_count,
         "annual_returns": annual,
     }
 
@@ -538,6 +587,11 @@ def save_result(path: Path, mode_to_metrics: Dict[str, Dict[str, Any]]) -> None:
             writer.writerow([mode, "avg_return", f"{m['avg_return']:.4f}"])
             writer.writerow([mode, "max_drawdown", f"{m['max_drawdown']:.4f}"])
             writer.writerow([mode, "profit_loss_ratio", f"{m['profit_loss_ratio']:.4f}"])
+            writer.writerow([mode, "avg_win", f"{m['avg_win']:.4f}"])
+            writer.writerow([mode, "avg_loss", f"{m['avg_loss']:.4f}"])
+            writer.writerow([mode, "stop_profit_count", m["stop_profit_count"]])
+            writer.writerow([mode, "stop_loss_count", m["stop_loss_count"]])
+            writer.writerow([mode, "timeout_exit_count", m["timeout_exit_count"]])
             for year, ret in sorted(m["annual_returns"].items()):
                 writer.writerow([mode, f"year_{year}", f"{ret:.4f}"])
 
@@ -553,7 +607,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fee-rate", type=float, default=0.003, help="transaction fee")
     parser.add_argument("--slippage", type=float, default=0.001, help="slippage")
     parser.add_argument("--regime-confirm-days", type=int, default=3, help="regime weak confirmation days")
-    parser.add_argument("--modes", nargs="+", default=["hold_3"], choices=["hold_3", "hold_5", "take_profit_stop_loss"], help="sell mode")
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        default=["hold_3"],
+        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3"],
+        help="sell mode",
+    )
     parser.add_argument("--limit-300", action="store_true", help="use hs300 universe")
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache_backtest"), help="cache folder")
     parser.add_argument("--output", type=Path, default=Path("backtest_result.csv"), help="output csv path")
