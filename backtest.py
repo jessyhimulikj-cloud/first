@@ -310,7 +310,10 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
 
         row = rows[idx]
         close = _to_float(row.get("close", 0))
+        high = _to_float(row.get("high", 0))
+        low = _to_float(row.get("low", 0))
         amount = _to_float(row.get("amount", 0))
+        volume = _to_float(row.get("volume", 0))
         pct_chg = _to_float(row.get("pct_chg", 0))
         if close <= 0 or amount <= 0:
             continue
@@ -318,6 +321,8 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
         closes = [_to_float(r.get("close", 0)) for r in rows[: idx + 1]]
         closes = [c for c in closes if c > 0]
         vols = [_to_float(r.get("amount", 0)) for r in rows[: idx + 1]]
+        trade_vols = [_to_float(r.get("volume", 0)) for r in rows[: idx + 1]]
+        trade_vols = [v for v in trade_vols if v > 0]
         pcts = [_to_float(r.get("pct_chg", 0)) for r in rows[: idx + 1]]
         if len(closes) < 20 or len(vols) < 6 or len(pcts) < 3:
             continue
@@ -343,6 +348,25 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
         if not (ma10 > ma10_prev):
             continue
         if not (3 <= m5 <= 15):
+            continue
+
+        # 新增过滤1：当日涨幅必须 > 2%
+        if pct_chg <= 2:
+            continue
+
+        # 新增过滤2：当日成交量 > 过去5日平均成交量（不含当天）
+        if len(trade_vols) < 6 or volume <= 0:
+            continue
+        avg_volume_5 = sum(trade_vols[-6:-1]) / 5.0
+        if avg_volume_5 <= 0 or volume <= avg_volume_5:
+            continue
+
+        # 新增过滤3：收盘靠近最高价
+        day_range = high - low
+        if day_range <= 0:
+            continue
+        close_pos = (close - low) / day_range
+        if close_pos <= 0.7:
             continue
 
         avg_vol5 = sum(vols[-5:]) / 5.0
