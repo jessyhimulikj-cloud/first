@@ -22,6 +22,7 @@ from typing import Any, Dict, List
 
 import csv
 
+from data_loader import load_history
 from stock_picker import _is_excluded_stock, _normalize_ts_code, robust_zscores
 
 
@@ -111,38 +112,27 @@ def load_universe(cache_dir: Path, size: int = 50) -> List[str]:
 
 
 def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> List[Dict[str, Any]]:
-    def _normalize_history_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        norm_rows: List[Dict[str, Any]] = []
-        for r in rows:
-            date_raw = r.get("date", r.get("日期", ""))
-            d = str(date_raw).replace("-", "").strip()
-            if not d:
-                continue
-            norm_rows.append(
-                {
-                    "date": d,
-                    "open": _to_float(r.get("open", r.get("开盘", 0))),
-                    "high": _to_float(r.get("high", r.get("最高", 0))),
-                    "low": _to_float(r.get("low", r.get("最低", 0))),
-                    "close": _to_float(r.get("close", r.get("收盘", 0))),
-                    "volume": _to_float(r.get("volume", r.get("成交量", 0))),
-                    "amount": _to_float(r.get("amount", r.get("成交额", 0))),
-                    "pct_chg": _to_float(r.get("pct_chg", r.get("涨跌幅", 0))),
-                }
-            )
-        return norm_rows
-
-    csv_path = Path("data") / f"{symbol}.csv"
-    if not csv_path.exists():
-        print(f"[history] {symbol} 本地CSV不存在: {csv_path}")
+    df = load_history(symbol, start, end, data_dir=Path("data"))
+    if df.empty:
         return []
-    with csv_path.open("r", encoding="utf-8", newline="") as f:
-        rows = list(csv.DictReader(f))
-        print(f"[history] {symbol} 原始df.shape=({len(rows)}, {len(rows[0]) if rows else 0}) 原始columns={list(rows[0].keys()) if rows else []}")
-    if not rows:
-        return []
-    norm_rows = _normalize_history_rows(rows)
-    return [r for r in norm_rows if start <= r["date"] <= end]
+    out: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        d = row["date"].strftime("%Y%m%d")
+        if not (start <= d <= end):
+            continue
+        out.append(
+            {
+                "date": d,
+                "open": _to_float(row.get("open", 0)),
+                "high": _to_float(row.get("high", 0)),
+                "low": _to_float(row.get("low", 0)),
+                "close": _to_float(row.get("close", 0)),
+                "volume": _to_float(row.get("volume", 0)),
+                "amount": _to_float(row.get("amount", 0)),
+                "pct_chg": _to_float(row.get("pct_chg", 0)),
+            }
+        )
+    return out
 
 
 def load_hs300_history(start: str, end: str, cache_dir: Path) -> List[Dict[str, Any]]:
