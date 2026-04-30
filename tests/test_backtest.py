@@ -43,7 +43,7 @@ def test_parse_args_defaults(monkeypatch):
     monkeypatch.setattr("sys.argv", ["backtest.py"])
     args = parse_args()
     assert args.months == 3
-    assert args.universe_size == 50
+    assert args.universe_size == 30
     assert args.max_days == 60
     assert args.modes == ["hold_3"]
     assert args.fee_rate == 0.003

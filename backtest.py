@@ -24,6 +24,15 @@ import csv
 
 from stock_picker import _is_excluded_stock, _normalize_ts_code, robust_zscores
 
+fallback_symbols = [
+    "000001", "000002", "000063", "000333", "000651",
+    "000725", "002129", "002230", "002241", "002475",
+    "002594", "002714", "300014", "300015", "300059",
+    "300122", "300274", "300750", "300760", "300782",
+    "600000", "600009", "600030", "600036", "600050",
+    "600276", "600309", "600519", "600887", "601012",
+]
+
 
 @dataclass
 class TradeRecord:
@@ -79,28 +88,11 @@ def _em_session() -> Any:
 
 
 def load_universe(cache_dir: Path, size: int = 50) -> List[str]:
-    """使用全A股票代码表构建股票池，并覆盖写入缓存文件。"""
-    ak = _import_akshare()
+    """使用固定股票池，并覆盖写入缓存文件。"""
     cache_file = cache_dir / f"universe_{size}.csv"
-    info_df = ak.stock_info_a_code_name()
-    rows = _df_to_rows(info_df)
-
-    prefixes = ("000", "001", "002", "300", "301", "600", "601", "603", "605", "688")
-    code_name_pairs: List[tuple[str, str]] = []
-    for r in rows:
-        code = str(r.get("code", "")).strip()
-        name = str(r.get("name", "")).strip()
-        if len(code) != 6 or (not code.isdigit()):
-            continue
-        if not code.startswith(prefixes):
-            continue
-        if ("ST" in name.upper()) or ("退" in name):
-            continue
-        code_name_pairs.append((code, name))
-
-    if size > 0:
-        code_name_pairs = code_name_pairs[:size]
-    codes = [x[0] for x in code_name_pairs]
+    symbols = fallback_symbols[:size] if size > 0 else fallback_symbols
+    code_name_pairs = [(s, s) for s in symbols]
+    codes = list(symbols)
 
     with cache_file.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
@@ -584,7 +576,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=["akshare", "eastmoney"], default="akshare", help="data source")
     parser.add_argument("--months", type=int, default=3, help="backtest months")
-    parser.add_argument("--universe-size", type=int, default=50, help="stock universe size")
+    parser.add_argument("--universe-size", type=int, default=30, help="stock universe size")
     parser.add_argument("--max-days", type=int, default=60, help="max trading days")
     parser.add_argument("--fee-rate", type=float, default=0.003, help="transaction fee")
     parser.add_argument("--slippage", type=float, default=0.001, help="slippage")
@@ -599,6 +591,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-300", action="store_true", help="use hs300 universe")
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache_backtest"), help="cache folder")
     parser.add_argument("--output", type=Path, default=Path("backtest_result.csv"), help="output csv path")
+    parser.add_argument("--no-market-filter", action="store_true", help="disable market regime filter")
     return parser.parse_args()
 
 
@@ -645,10 +638,13 @@ def main() -> None:
     trading_days = sorted({r["date"] for rows in universe_data.values() for r in rows})
     print(f"交易日数量: {len(trading_days)}")
 
-    print("[3.5/5] 加载沪深300环境过滤...")
-    hs300_rows = load_hs300_history(start, end, args.cache_dir)
-    hs300_allow = build_hs300_filter(hs300_rows, confirm_days=args.regime_confirm_days)
-    aligned_hs300_allow = align_regime_filter_to_trade_days(trading_days, hs300_allow)
+    if args.no_market_filter:
+        aligned_hs300_allow = {d: True for d in trading_days}
+    else:
+        print("[3.5/5] 加载沪深300环境过滤...")
+        hs300_rows = load_hs300_history(start, end, args.cache_dir)
+        hs300_allow = build_hs300_filter(hs300_rows, confirm_days=args.regime_confirm_days)
+        aligned_hs300_allow = align_regime_filter_to_trade_days(trading_days, hs300_allow)
 
     # 名称映射（用实时快照，失败则用代码）
     name_map: Dict[str, str] = {}
