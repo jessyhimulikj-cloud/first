@@ -67,6 +67,21 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _normalize_yyyymmdd(value: Any) -> str:
+    """统一日期为 YYYYMMDD 字符串。"""
+    s = str(value).strip()
+    if not s:
+        return ""
+    s = s.replace("-", "").replace("/", "")
+    if len(s) == 8 and s.isdigit():
+        return s
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt.strftime("%Y%m%d")
+    except Exception:
+        return s
+
+
 def _cache_path(cache_dir: Path, symbol: str) -> Path:
     return cache_dir / f"{symbol}.csv"
 
@@ -241,6 +256,7 @@ def momentum(closes: List[float], days: int) -> float:
 
 
 def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]], name_map: Dict[str, str], debug: bool = False) -> str | None:
+    current_date = _normalize_yyyymmdd(day)
     candidates: List[Dict[str, Any]] = []
     s1 = s2 = s3 = s4 = s5 = s6 = s7 = 0
     ma20_isna_count = 0
@@ -251,11 +267,11 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
     day_preview: List[Dict[str, Any]] = []
 
     for symbol, rows in universe_data.items():
-        day_rows = [r for r in rows if str(r.get("date", "")) == day]
+        day_rows = [r for r in rows if _normalize_yyyymmdd(r.get("date", "")) == current_date]
         if not day_rows:
             continue
         row = day_rows[0]
-        idx = next((i for i, r in enumerate(rows) if str(r.get("date", "")) == day), -1)
+        idx = next((i for i, r in enumerate(rows) if _normalize_yyyymmdd(r.get("date", "")) == current_date), -1)
         if idx < 5:
             continue
 
