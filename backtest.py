@@ -255,208 +255,33 @@ def momentum(closes: List[float], days: int) -> float:
     return (closes[-1] / closes[-(days + 1)] - 1.0) * 100.0
 
 
-def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]], name_map: Dict[str, str], debug: bool = False) -> str | None:
+def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]], name_map: Dict[str, str], max_picks: int = 3) -> List[str]:
+    """简化版日选股：按 check_ma_debug.py 同款按日取行逻辑，返回最多 max_picks 只股票。"""
     current_date = _normalize_yyyymmdd(day)
-    candidates: List[Dict[str, Any]] = []
-    s1 = s2 = s3 = s4 = s5 = s6 = s7 = 0
-    ma20_isna_count = 0
-    ma60_isna_count = 0
-    close_gt_ma20_count = 0
-    close_eq_ma20_count = 0
-    close_lt_ma20_count = 0
-    day_preview: List[Dict[str, Any]] = []
-
+    picked: List[str] = []
     for symbol, rows in universe_data.items():
         day_rows = [r for r in rows if _normalize_yyyymmdd(r.get("date", "")) == current_date]
         if not day_rows:
             continue
-        row = day_rows[0]
-        idx = next((i for i, r in enumerate(rows) if _normalize_yyyymmdd(r.get("date", "")) == current_date), -1)
-        if idx < 5:
-            continue
-
+        r = day_rows[0]
         try:
-            close = float(row.get("close", 0))
+            close = float(r["close"])
+            ma20 = float(r["ma20"])
+            ma60 = float(r["ma60"])
+            pct_chg = float(r["pct_chg"])
+            amount = float(r["amount"])
+            volume = float(r["volume"])
+            vol_ma5 = float(r["vol_ma5"])
         except Exception:
             continue
-        high = _to_float(row.get("high", 0))
-        low = _to_float(row.get("low", 0))
-        amount = _to_float(row.get("amount", 0))
-        volume = _to_float(row.get("volume", 0))
-        pct_chg = _to_float(row.get("pct_chg", 0))
-        if close <= 0 or amount <= 0:
-            continue
-        s1 += 1
-
-        closes = [_to_float(r.get("close", 0)) for r in rows[: idx + 1]]
-        closes = [c for c in closes if c > 0]
-        vols = [_to_float(r.get("amount", 0)) for r in rows[: idx + 1]]
-        trade_vols = [_to_float(r.get("volume", 0)) for r in rows[: idx + 1]]
-        trade_vols = [v for v in trade_vols if v > 0]
-        pcts = [_to_float(r.get("pct_chg", 0)) for r in rows[: idx + 1]]
-        if len(closes) < 60 or len(vols) < 6 or len(pcts) < 3:
-            continue
-
-        name = name_map.get(symbol, symbol)
-        # 关键修复：过滤前先转为 float，避免 str/int 比较异常
-        excluded, _ = _is_excluded_stock(symbol, name, close, amount, pct_chg)
-        if excluded:
-            continue
-
-        try:
-            m3 = momentum(closes, 3)
-            m5 = momentum(closes, 5)
-            m10 = momentum(closes, 10)
-        except Exception:
-            continue
-
-        # 排除上市不足120天新股
-        if idx + 1 < 120:
-            continue
-
-        ma5 = sum(closes[-5:]) / 5.0
-        ma10 = sum(closes[-10:]) / 10.0
-        ma20 = _to_float(row.get("ma20", float("nan")), float("nan"))
-        ma60 = _to_float(row.get("ma60", float("nan")), float("nan"))
-        if len(day_preview) < 5:
-            day_preview.append(
-                {
-                    "symbol": symbol,
-                    "date": str(row.get("date", "")),
-                    "close": close,
-                    "ma20": ma20,
-                    "ma60": ma60,
-                    "pct_chg": pct_chg,
-                    "volume": volume,
-                    "vol_ma5": row.get("vol_ma5"),
-                    "amount": amount,
-                }
-            )
+        _ = ma60, volume, vol_ma5
         if math.isnan(close) or math.isnan(ma20):
-            ma20_isna_count += 1
             continue
-        if close > ma20:
-            close_gt_ma20_count += 1
-        elif close == ma20:
-            close_eq_ma20_count += 1
-        else:
-            close_lt_ma20_count += 1
-        if math.isnan(ma60):
-            ma60_isna_count += 1
-            continue
-        ma10_prev = sum(closes[-11:-1]) / 10.0
-        if not (close > ma5 > ma10):
-            continue
-        if not (ma10 > ma10_prev):
-            continue
-        if not (3 <= m5 <= 15):
-            continue
-
-        # 成交额过滤：> 5亿
-        if amount <= 5e8:
-            continue
-
-        # close > ma20 & ma60
-        if close <= ma20:
-            continue
-        s2 += 1
-        if close <= ma60:
-            continue
-        s3 += 1
-
-        # 当日涨幅在 1.5% 到 6% 之间
-        if not (1.5 <= pct_chg <= 6):
-            continue
-        s4 += 1
-
-        # 当日成交量 > 过去5日平均成交量 1.2 倍（不含当天）
-        if len(trade_vols) < 6 or volume <= 0:
-            continue
-        avg_volume_5 = sum(trade_vols[-6:-1]) / 5.0
-        if avg_volume_5 <= 0 or volume <= avg_volume_5 * 1.2:
-            continue
-        s5 += 1
-
-        # 收盘位置强度
-        day_range = high - low
-        if day_range <= 0:
-            continue
-        close_pos = (close - low) / day_range
-        if close_pos <= 0.65:
-            continue
-        s6 += 1
-
-        # 最近3日累计涨幅 < 10%
-        try:
-            ret3 = (close / closes[-4] - 1.0) * 100.0
-        except Exception:
-            continue
-        if ret3 >= 10:
-            continue
-        s7 += 1
-
-        avg_vol5 = sum(vols[-5:]) / 5.0
-        if avg_vol5 <= 0:
-            continue
-        volume_ratio = amount / avg_vol5
-        if volume_ratio <= 1.3:
-            continue
-
-        candidates.append(
-            {
-            "symbol": symbol,
-            "close": close,
-            "pct_chg": pct_chg,
-            "amount": amount,
-            "momentum_3": m3,
-            "momentum_5": m5,
-            "ret_5": m5,
-            "ret_10": m10,
-            "ma5": ma5,
-            "ma10": ma10,
-            "volume_ratio": volume_ratio,
-            }
-        )
-
-    if not candidates:
-        if debug:
-            for x in day_preview:
-                print(
-                    f"[diag-sample] {day} symbol={x['symbol']} date={x['date']} close={x['close']:.3f} "
-                    f"ma20={x['ma20']} ma60={x['ma60']} pct_chg={x['pct_chg']:.3f} "
-                    f"volume={x['volume']:.3f} vol_ma5={x['vol_ma5']} amount={x['amount']:.3f}"
-                )
-            print(
-                f"[diag] {day} s1_data={s1} s2_ma20={s2} s3_ma60={s3} s4_pct={s4} "
-                f"s5_vol={s5} s6_closepos={s6} s7_ret3={s7} "
-                f"ma20_isna_count={ma20_isna_count} ma60_isna_count={ma60_isna_count} "
-                f"close_gt_ma20_count={close_gt_ma20_count} close_eq_ma20_count={close_eq_ma20_count} "
-                f"close_lt_ma20_count={close_lt_ma20_count} final=0"
-            )
-        return None
-
-    liq_z = robust_zscores([c["amount"] for c in candidates])
-    for i, c in enumerate(candidates):
-        c["liquidity_z"] = liq_z[i]
-        c["total_score"] = 0.30 * c["momentum_5"] + 0.20 * c["momentum_3"] + 0.30 * c["liquidity_z"] + 0.20 * c["pct_chg"]
-
-    candidates.sort(key=lambda x: x["total_score"], reverse=True)
-    top3 = candidates[:3]
-    if debug:
-        for x in day_preview:
-            print(
-                f"[diag-sample] {day} symbol={x['symbol']} date={x['date']} close={x['close']:.3f} "
-                f"ma20={x['ma20']} ma60={x['ma60']} pct_chg={x['pct_chg']:.3f} "
-                f"volume={x['volume']:.3f} vol_ma5={x['vol_ma5']} amount={x['amount']:.3f}"
-            )
-        print(
-            f"[diag] {day} s1_data={s1} s2_ma20={s2} s3_ma60={s3} s4_pct={s4} "
-            f"s5_vol={s5} s6_closepos={s6} s7_ret3={s7} "
-            f"ma20_isna_count={ma20_isna_count} ma60_isna_count={ma60_isna_count} "
-            f"close_gt_ma20_count={close_gt_ma20_count} close_eq_ma20_count={close_eq_ma20_count} "
-            f"close_lt_ma20_count={close_lt_ma20_count} final={len(top3)}"
-        )
-    return top3[0]["symbol"] if top3 else None
+        if close > ma20 and pct_chg > 0 and amount > 100000000:
+            picked.append(symbol)
+        if len(picked) >= max_picks:
+            break
+    return picked
 
 
 def _apply_cost(raw_ret: float, fee_rate: float, slippage: float) -> float:
@@ -473,11 +298,12 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, 
     next_open = _to_float(rows[buy_idx].get("open", 0))
     if signal_close <= 0 or next_open <= 0:
         return None
-    # 严格使用 T 日收盘选股、T+1 开盘买入
-    open_gap_pct = (next_open / signal_close - 1.0) * 100
-    # 次日开盘涨幅必须在 [-1%, +2%]
-    if open_gap_pct > 2 or open_gap_pct < -1:
-        return None
+    if mode != "loose_hold3":
+        # 严格使用 T 日收盘选股、T+1 开盘买入
+        open_gap_pct = (next_open / signal_close - 1.0) * 100
+        # 次日开盘涨幅必须在 [-1%, +2%]
+        if open_gap_pct > 2 or open_gap_pct < -1:
+            return None
 
     # 买入价修正为 next_day_open，避免回测偏差
     buy_price = next_open
@@ -696,7 +522,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["hold_3"],
+        default=["loose_hold3"],
         choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3"],
         help="sell mode",
     )
@@ -782,42 +608,23 @@ def main() -> None:
             print(f"{day} 跳过（弱势市场）")
             skipped_bear_days += 1
             continue
-        symbol = pick_stock_for_day(day, universe_data, name_map, debug=(idx < 10))
-        if not symbol:
+        picks = pick_stock_for_day(day, universe_data, name_map, max_picks=3)
+        if not picks:
             continue
-
-        if "loose_hold3" in modes:
-            loose_candidates = []
-            for sym, rows2 in universe_data.items():
-                j = next((i for i, r in enumerate(rows2) if r["date"] == day), -1)
-                if j < 20:
-                    continue
-                row = rows2[j]
-                c = _to_float(row.get("close", 0))
-                a = _to_float(row.get("amount", 0))
-                p = _to_float(row.get("pct_chg", 0))
-                closes2 = [_to_float(r.get("close", 0)) for r in rows2[: j + 1]]
-                closes2 = [x for x in closes2 if x > 0]
-                if len(closes2) < 20:
-                    continue
-                ma20_2 = sum(closes2[-20:]) / 20.0
-                if c > ma20_2 and p > 0 and a > 100000000:
-                    loose_candidates.append(sym)
-            if loose_candidates:
-                symbol = loose_candidates[0]
-
-        rows = universe_data.get(symbol, [])
-        day_idx = next((i for i, r in enumerate(rows) if r["date"] == day), -1)
-        if day_idx < 0:
-            continue
-
-        for mode in modes:
-            try:
-                tr = run_trade(symbol, day_idx, rows, mode, args.fee_rate, args.slippage)
-                if tr:
-                    mode_trades[mode].append(tr)
-            except Exception:
+        for symbol in picks:
+            rows = universe_data.get(symbol, [])
+            day_idx = next((i for i, r in enumerate(rows) if r["date"] == day), -1)
+            if day_idx < 0:
                 continue
+            for mode in modes:
+                if mode != "loose_hold3":
+                    continue
+                try:
+                    tr = run_trade(symbol, day_idx, rows, mode, args.fee_rate, args.slippage)
+                    if tr:
+                        mode_trades[mode].append(tr)
+                except Exception:
+                    continue
 
         if idx % 20 == 0:
             print(f"  回测进度: {idx}/{len(trade_days)}")
