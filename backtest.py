@@ -114,12 +114,12 @@ def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> L
         rows = list(csv.DictReader(f))
     if not rows:
         return []
-    out: List[Dict[str, Any]] = []
+    full_rows: List[Dict[str, Any]] = []
     for row in rows:
         d = str(row.get("date", "")).replace("-", "").strip()
-        if not (start <= d <= end):
+        if len(d) != 8:
             continue
-        out.append(
+        full_rows.append(
             {
                 "date": d,
                 "open": _to_float(row.get("open", 0)),
@@ -131,6 +131,17 @@ def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> L
                 "pct_chg": _to_float(row.get("pct_chg", 0)),
             }
         )
+    full_rows.sort(key=lambda x: x["date"])
+
+    closes = [r["close"] for r in full_rows]
+    volumes = [r["volume"] for r in full_rows]
+    for i, r in enumerate(full_rows):
+        r["ma5"] = (sum(closes[i - 4 : i + 1]) / 5.0) if i >= 4 else None
+        r["ma20"] = (sum(closes[i - 19 : i + 1]) / 20.0) if i >= 19 else None
+        r["ma60"] = (sum(closes[i - 59 : i + 1]) / 60.0) if i >= 59 else None
+        r["vol_ma5"] = (sum(volumes[i - 4 : i + 1]) / 5.0) if i >= 4 else None
+
+    out = [r for r in full_rows if start <= r["date"] <= end]
     return out
 
 
@@ -231,6 +242,8 @@ def momentum(closes: List[float], days: int) -> float:
 def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]], name_map: Dict[str, str], debug: bool = False) -> str | None:
     candidates: List[Dict[str, Any]] = []
     s1 = s2 = s3 = s4 = s5 = s6 = s7 = 0
+    ma20_isna_count = 0
+    ma60_isna_count = 0
 
     for symbol, rows in universe_data.items():
         idx = next((i for i, r in enumerate(rows) if r["date"] == day), -1)
@@ -276,8 +289,14 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
 
         ma5 = sum(closes[-5:]) / 5.0
         ma10 = sum(closes[-10:]) / 10.0
-        ma20 = sum(closes[-20:]) / 20.0
-        ma60 = sum(closes[-60:]) / 60.0
+        ma20 = row.get("ma20")
+        ma60 = row.get("ma60")
+        if ma20 is None:
+            ma20_isna_count += 1
+            continue
+        if ma60 is None:
+            ma60_isna_count += 1
+            continue
         ma10_prev = sum(closes[-11:-1]) / 10.0
         if not (close > ma5 > ma10):
             continue
@@ -356,7 +375,8 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
         if debug:
             print(
                 f"[diag] {day} s1_data={s1} s2_ma20={s2} s3_ma60={s3} s4_pct={s4} "
-                f"s5_vol={s5} s6_closepos={s6} s7_ret3={s7} final=0"
+                f"s5_vol={s5} s6_closepos={s6} s7_ret3={s7} "
+                f"ma20_isna_count={ma20_isna_count} ma60_isna_count={ma60_isna_count} final=0"
             )
         return None
 
@@ -370,7 +390,8 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
     if debug:
         print(
             f"[diag] {day} s1_data={s1} s2_ma20={s2} s3_ma60={s3} s4_pct={s4} "
-            f"s5_vol={s5} s6_closepos={s6} s7_ret3={s7} final={len(top3)}"
+            f"s5_vol={s5} s6_closepos={s6} s7_ret3={s7} "
+            f"ma20_isna_count={ma20_isna_count} ma60_isna_count={ma60_isna_count} final={len(top3)}"
         )
     return top3[0]["symbol"] if top3 else None
 
