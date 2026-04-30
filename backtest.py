@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -250,12 +251,18 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
     day_preview: List[Dict[str, Any]] = []
 
     for symbol, rows in universe_data.items():
-        idx = next((i for i, r in enumerate(rows) if r["date"] == day), -1)
+        day_rows = [r for r in rows if str(r.get("date", "")) == day]
+        if not day_rows:
+            continue
+        row = day_rows[0]
+        idx = next((i for i, r in enumerate(rows) if str(r.get("date", "")) == day), -1)
         if idx < 5:
             continue
 
-        row = rows[idx]
-        close = _to_float(row.get("close", 0))
+        try:
+            close = float(row.get("close", 0))
+        except Exception:
+            continue
         high = _to_float(row.get("high", 0))
         low = _to_float(row.get("low", 0))
         amount = _to_float(row.get("amount", 0))
@@ -293,12 +300,13 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
 
         ma5 = sum(closes[-5:]) / 5.0
         ma10 = sum(closes[-10:]) / 10.0
-        ma20 = row.get("ma20")
-        ma60 = row.get("ma60")
+        ma20 = _to_float(row.get("ma20", float("nan")), float("nan"))
+        ma60 = _to_float(row.get("ma60", float("nan")), float("nan"))
         if len(day_preview) < 5:
             day_preview.append(
                 {
                     "symbol": symbol,
+                    "date": str(row.get("date", "")),
                     "close": close,
                     "ma20": ma20,
                     "ma60": ma60,
@@ -308,7 +316,7 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
                     "amount": amount,
                 }
             )
-        if ma20 is None:
+        if math.isnan(close) or math.isnan(ma20):
             ma20_isna_count += 1
             continue
         if close > ma20:
@@ -317,7 +325,7 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
             close_eq_ma20_count += 1
         else:
             close_lt_ma20_count += 1
-        if ma60 is None:
+        if math.isnan(ma60):
             ma60_isna_count += 1
             continue
         ma10_prev = sum(closes[-11:-1]) / 10.0
@@ -398,7 +406,7 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
         if debug:
             for x in day_preview:
                 print(
-                    f"[diag-sample] {day} symbol={x['symbol']} close={x['close']:.3f} "
+                    f"[diag-sample] {day} symbol={x['symbol']} date={x['date']} close={x['close']:.3f} "
                     f"ma20={x['ma20']} ma60={x['ma60']} pct_chg={x['pct_chg']:.3f} "
                     f"volume={x['volume']:.3f} vol_ma5={x['vol_ma5']} amount={x['amount']:.3f}"
                 )
@@ -421,7 +429,7 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
     if debug:
         for x in day_preview:
             print(
-                f"[diag-sample] {day} symbol={x['symbol']} close={x['close']:.3f} "
+                f"[diag-sample] {day} symbol={x['symbol']} date={x['date']} close={x['close']:.3f} "
                 f"ma20={x['ma20']} ma60={x['ma60']} pct_chg={x['pct_chg']:.3f} "
                 f"volume={x['volume']:.3f} vol_ma5={x['vol_ma5']} amount={x['amount']:.3f}"
             )
