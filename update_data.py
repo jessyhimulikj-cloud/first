@@ -1,40 +1,33 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
-from datetime import datetime, timedelta
-from pathlib import Path
+import time
 
-from backtest import load_universe
-from data_loader import load_history
+from eastmoney_data import load_history
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--months", type=int, default=6)
-    p.add_argument("--universe-size", type=int, default=50)
-    p.add_argument("--cache-dir", type=Path, default=Path(".cache_backtest"))
-    p.add_argument("--data-dir", type=Path, default=Path("data"))
-    return p.parse_args()
+fallback_symbols = [
+    "000001", "000858", "002415", "300750", "300760", "600036", "600519", "601318", "603259", "688981",
+    "000333", "002594", "300059", "600276", "601012", "601888", "603288", "605499", "688111", "000725",
+]
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=31 * args.months + 10)
-    start = start_dt.strftime("%Y%m%d")
-    end = end_dt.strftime("%Y%m%d")
-
-    symbols = load_universe(args.cache_dir, size=args.universe_size)
+    max_calls = 100
     ok = 0
     fail = 0
-    for symbol in symbols:
-        df = load_history(symbol, start, end, data_dir=args.data_dir)
+    calls = 0
+
+    for symbol in fallback_symbols:
+        if calls >= max_calls:
+            break
+        df = load_history(symbol, months=12)
+        calls += 1
         if df.empty:
             fail += 1
         else:
             ok += 1
+        time.sleep(1.5)
 
     print(f"成功数量: {ok}")
     print(f"失败数量: {fail}")
-    print(f"CSV保存路径: {args.data_dir.resolve()}")

@@ -22,7 +22,6 @@ from typing import Any, Dict, List
 
 import csv
 
-from data_loader import load_history
 from stock_picker import _is_excluded_stock, _normalize_ts_code, robust_zscores
 
 
@@ -116,12 +115,16 @@ def load_universe(cache_dir: Path, size: int = 50) -> List[str]:
 
 
 def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> List[Dict[str, Any]]:
-    df = load_history(symbol, start, end, data_dir=Path("data"))
-    if df.empty:
+    csv_path = Path("data") / f"{symbol}.csv"
+    if not csv_path.exists():
+        return []
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
         return []
     out: List[Dict[str, Any]] = []
-    for _, row in df.iterrows():
-        d = row["date"].strftime("%Y%m%d")
+    for row in rows:
+        d = str(row.get("date", "")).replace("-", "").strip()
         if not (start <= d <= end):
             continue
         out.append(

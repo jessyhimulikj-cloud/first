@@ -4,18 +4,17 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import pandas as pd
 import requests
 
 
 SKILL_API_URL = "https://api.eastmoney.com/skills/v1/query"
 
 
-def request_eastmoney_skill(query: str) -> pd.DataFrame:
+def request_eastmoney_skill(query: str) -> dict[str, Any] | None:
     api_key = os.getenv("EASTMONEY_APIKEY", "").strip()
     if not api_key:
         print("[eastmoney_client] 缺少 EASTMONEY_APIKEY，请先配置环境变量。")
-        return pd.DataFrame()
+        return None
 
     session = requests.Session()
     session.trust_env = False
@@ -26,27 +25,14 @@ def request_eastmoney_skill(query: str) -> pd.DataFrame:
     }
     payload: dict[str, Any] = {"query": query}
 
-    try:
-        resp = session.post(SKILL_API_URL, headers=headers, json=payload, timeout=20)
-        resp.raise_for_status()
-    except Exception as exc:
-        print(f"[eastmoney_client] 请求失败: {exc}")
-        return pd.DataFrame()
+    resp = session.post(SKILL_API_URL, headers=headers, json=payload, timeout=20)
+    if resp.status_code >= 400:
+        body = resp.text[:300]
+        print(f"[eastmoney_client] 请求失败 status={resp.status_code}, body={body}")
+        return None
 
     try:
-        data = resp.json()
-    except Exception as exc:
-        print(f"[eastmoney_client] 响应不是有效 JSON: {exc}")
-        return pd.DataFrame()
-
-    rows = ((data or {}).get("data") or {}).get("rows")
-    if not isinstance(rows, list) or not rows:
-        print(f"[eastmoney_client] 无数据返回，响应键: {list((data or {}).keys())}")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        print("[eastmoney_client] DataFrame 为空。")
-        return df
-
-    return df
+        return resp.json()
+    except Exception:
+        print(f"[eastmoney_client] 响应解析失败 status={resp.status_code}, body={resp.text[:300]}")
+        return None
