@@ -244,6 +244,10 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
     s1 = s2 = s3 = s4 = s5 = s6 = s7 = 0
     ma20_isna_count = 0
     ma60_isna_count = 0
+    close_gt_ma20_count = 0
+    close_eq_ma20_count = 0
+    close_lt_ma20_count = 0
+    day_preview: List[Dict[str, Any]] = []
 
     for symbol, rows in universe_data.items():
         idx = next((i for i, r in enumerate(rows) if r["date"] == day), -1)
@@ -291,9 +295,28 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
         ma10 = sum(closes[-10:]) / 10.0
         ma20 = row.get("ma20")
         ma60 = row.get("ma60")
+        if len(day_preview) < 5:
+            day_preview.append(
+                {
+                    "symbol": symbol,
+                    "close": close,
+                    "ma20": ma20,
+                    "ma60": ma60,
+                    "pct_chg": pct_chg,
+                    "volume": volume,
+                    "vol_ma5": row.get("vol_ma5"),
+                    "amount": amount,
+                }
+            )
         if ma20 is None:
             ma20_isna_count += 1
             continue
+        if close > ma20:
+            close_gt_ma20_count += 1
+        elif close == ma20:
+            close_eq_ma20_count += 1
+        else:
+            close_lt_ma20_count += 1
         if ma60 is None:
             ma60_isna_count += 1
             continue
@@ -373,10 +396,18 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
 
     if not candidates:
         if debug:
+            for x in day_preview:
+                print(
+                    f"[diag-sample] {day} symbol={x['symbol']} close={x['close']:.3f} "
+                    f"ma20={x['ma20']} ma60={x['ma60']} pct_chg={x['pct_chg']:.3f} "
+                    f"volume={x['volume']:.3f} vol_ma5={x['vol_ma5']} amount={x['amount']:.3f}"
+                )
             print(
                 f"[diag] {day} s1_data={s1} s2_ma20={s2} s3_ma60={s3} s4_pct={s4} "
                 f"s5_vol={s5} s6_closepos={s6} s7_ret3={s7} "
-                f"ma20_isna_count={ma20_isna_count} ma60_isna_count={ma60_isna_count} final=0"
+                f"ma20_isna_count={ma20_isna_count} ma60_isna_count={ma60_isna_count} "
+                f"close_gt_ma20_count={close_gt_ma20_count} close_eq_ma20_count={close_eq_ma20_count} "
+                f"close_lt_ma20_count={close_lt_ma20_count} final=0"
             )
         return None
 
@@ -388,10 +419,18 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
     candidates.sort(key=lambda x: x["total_score"], reverse=True)
     top3 = candidates[:3]
     if debug:
+        for x in day_preview:
+            print(
+                f"[diag-sample] {day} symbol={x['symbol']} close={x['close']:.3f} "
+                f"ma20={x['ma20']} ma60={x['ma60']} pct_chg={x['pct_chg']:.3f} "
+                f"volume={x['volume']:.3f} vol_ma5={x['vol_ma5']} amount={x['amount']:.3f}"
+            )
         print(
             f"[diag] {day} s1_data={s1} s2_ma20={s2} s3_ma60={s3} s4_pct={s4} "
             f"s5_vol={s5} s6_closepos={s6} s7_ret3={s7} "
-            f"ma20_isna_count={ma20_isna_count} ma60_isna_count={ma60_isna_count} final={len(top3)}"
+            f"ma20_isna_count={ma20_isna_count} ma60_isna_count={ma60_isna_count} "
+            f"close_gt_ma20_count={close_gt_ma20_count} close_eq_ma20_count={close_eq_ma20_count} "
+            f"close_lt_ma20_count={close_lt_ma20_count} final={len(top3)}"
         )
     return top3[0]["symbol"] if top3 else None
 
