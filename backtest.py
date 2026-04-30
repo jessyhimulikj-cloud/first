@@ -255,15 +255,24 @@ def momentum(closes: List[float], days: int) -> float:
     return (closes[-1] / closes[-(days + 1)] - 1.0) * 100.0
 
 
-def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]], name_map: Dict[str, str], max_picks: int = 3) -> List[str]:
-    """简化版日选股：按 check_ma_debug.py 同款按日取行逻辑，返回最多 max_picks 只股票。"""
+def pick_stock_for_day(
+    day: str,
+    universe_data: Dict[str, List[Dict[str, Any]]],
+    name_map: Dict[str, str],
+    mode: str = "loose_hold3",
+) -> List[str]:
+    """按日选股（row-by-date），支持 loose_hold3 与 momentum_hold3_v1。"""
     current_date = _normalize_yyyymmdd(day)
     picked: List[str] = []
+    max_picks = 2 if mode == "momentum_hold3_v1" else 3
     for symbol, rows in universe_data.items():
         day_rows = [r for r in rows if _normalize_yyyymmdd(r.get("date", "")) == current_date]
         if not day_rows:
             continue
         r = day_rows[0]
+        idx = next((i for i, x in enumerate(rows) if _normalize_yyyymmdd(x.get("date", "")) == current_date), -1)
+        if idx < 0:
+            continue
         try:
             close = float(r["close"])
             ma20 = float(r["ma20"])
@@ -272,12 +281,41 @@ def pick_stock_for_day(day: str, universe_data: Dict[str, List[Dict[str, Any]]],
             amount = float(r["amount"])
             volume = float(r["volume"])
             vol_ma5 = float(r["vol_ma5"])
+            high = float(r["high"])
+            low = float(r["low"])
         except Exception:
             continue
-        _ = ma60, volume, vol_ma5
+        _ = ma60, name_map
         if math.isnan(close) or math.isnan(ma20):
             continue
-        if close > ma20 and pct_chg > 0 and amount > 100000000:
+
+        if mode == "momentum_hold3_v1":
+            if math.isnan(ma60) or math.isnan(vol_ma5):
+                continue
+            if idx < 3:
+                continue
+            if not (close > ma20 and close > ma60):
+                continue
+            if not (1.5 <= pct_chg <= 5.5):
+                continue
+            if amount <= 300000000:
+                continue
+            if vol_ma5 <= 0 or volume <= vol_ma5 * 1.2:
+                continue
+            day_range = high - low
+            if day_range <= 0:
+                continue
+            close_pos = (close - low) / day_range
+            if close_pos <= 0.65:
+                continue
+            prev3_close = _to_float(rows[idx - 3].get("close", 0))
+            if prev3_close <= 0:
+                continue
+            ret3 = (close / prev3_close - 1.0) * 100.0
+            if ret3 >= 9:
+                continue
+            picked.append(symbol)
+        elif close > ma20 and pct_chg > 0 and amount > 100000000:
             picked.append(symbol)
         if len(picked) >= max_picks:
             break
@@ -345,7 +383,7 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, 
         ret = _apply_cost((sell_price / buy_price - 1.0), fee_rate, slippage)
         return TradeRecord(symbol, rows[buy_idx]["date"], sell_date, buy_price, sell_price, ret, mode, exit_reason)
 
-    if mode == "loose_hold3":
+    if mode in ("loose_hold3", "momentum_hold3_v1"):
         last_idx = min(len(rows) - 1, buy_idx + 2)
         sell_price = _to_float(rows[last_idx].get("close", 0))
         if sell_price <= 0:
@@ -522,8 +560,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["loose_hold3"],
-        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3"],
+        default=["loose_hold3", "momentum_hold3_v1"],
+        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1"],
         help="sell mode",
     )
     parser.add_argument("--limit-300", action="store_true", help="use hs300 universe")
@@ -608,16 +646,16 @@ def main() -> None:
             print(f"{day} 跳过（弱势市场）")
             skipped_bear_days += 1
             continue
-        picks = pick_stock_for_day(day, universe_data, name_map, max_picks=3)
-        if not picks:
-            continue
-        for symbol in picks:
-            rows = universe_data.get(symbol, [])
-            day_idx = next((i for i, r in enumerate(rows) if r["date"] == day), -1)
-            if day_idx < 0:
+        for mode in modes:
+            if mode not in ("loose_hold3", "momentum_hold3_v1"):
                 continue
-            for mode in modes:
-                if mode != "loose_hold3":
+            picks = pick_stock_for_day(day, universe_data, name_map, mode=mode)
+            if not picks:
+                continue
+            for symbol in picks:
+                rows = universe_data.get(symbol, [])
+                day_idx = next((i for i, r in enumerate(rows) if r["date"] == day), -1)
+                if day_idx < 0:
                     continue
                 try:
                     tr = run_trade(symbol, day_idx, rows, mode, args.fee_rate, args.slippage)
