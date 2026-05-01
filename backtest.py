@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import math
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -165,7 +166,7 @@ def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> L
 
 
 def load_hs300_history(start: str, end: str, cache_dir: Path) -> List[Dict[str, Any]]:
-    """加载沪深300指数历史，用于大盘环境过滤。"""
+    """使用 Tushare index_daily 加载沪深300指数历史，用于大盘环境过滤。"""
     cache_file = cache_dir / "hs300_index.csv"
     if cache_file.exists():
         with cache_file.open("r", encoding="utf-8", newline="") as f:
@@ -175,29 +176,65 @@ def load_hs300_history(start: str, end: str, cache_dir: Path) -> List[Dict[str, 
                 d = str(r.get("date", "")).replace("-", "")
                 if not d or not (start <= d <= end):
                     continue
-                out.append({"date": d, "close": _to_float(r.get("close", 0))})
+                out.append(
+                    {
+                        "date": d,
+                        "open": _to_float(r.get("open", 0)),
+                        "high": _to_float(r.get("high", 0)),
+                        "low": _to_float(r.get("low", 0)),
+                        "close": _to_float(r.get("close", 0)),
+                        "volume": _to_float(r.get("volume", 0)),
+                    }
+                )
             return out
 
-    ak = _import_akshare()
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("缺少环境变量 TUSHARE_TOKEN，无法获取沪深300指数数据")
     try:
-        idx_df = ak.stock_zh_index_daily_em(symbol="sh000300")
-        idx_rows = _df_to_rows(idx_df)
+        import tushare as ts
+        import pandas as pd
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("未安装 tushare/pandas，请执行: pip install tushare pandas") from exc
+    ts.set_token(token)
+    pro = ts.pro_api()
+
+    try:
+        idx_df = pro.index_daily(ts_code="000300.SH", start_date=start, end_date=end)
     except Exception:
         return []
+    if idx_df is None or idx_df.empty:
+        return []
+
+    keep = ["trade_date", "open", "high", "low", "close", "vol"]
+    for c in keep:
+        if c not in idx_df.columns:
+            idx_df[c] = 0
+    idx_df = idx_df[keep].copy()
+    idx_df = idx_df.rename(columns={"trade_date": "date", "vol": "volume"})
+    idx_df["date"] = pd.to_datetime(idx_df["date"], errors="coerce").dt.strftime("%Y%m%d")
+    idx_df = idx_df.dropna(subset=["date"]).sort_values("date")
 
     out: List[Dict[str, Any]] = []
-    for r in idx_rows:
+    for _, r in idx_df.iterrows():
         d = str(r.get("date", "")).replace("-", "")
-        close = _to_float(r.get("close", 0))
-        if d and close > 0:
-            out.append({"date": d, "close": close})
+        if d and start <= d <= end:
+            out.append(
+                {
+                    "date": d,
+                    "open": _to_float(r.get("open", 0)),
+                    "high": _to_float(r.get("high", 0)),
+                    "low": _to_float(r.get("low", 0)),
+                    "close": _to_float(r.get("close", 0)),
+                    "volume": _to_float(r.get("volume", 0)),
+                }
+            )
 
     with cache_file.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "close"])
+        writer = csv.DictWriter(f, fieldnames=["date", "open", "high", "low", "close", "volume"])
         writer.writeheader()
         writer.writerows(out)
-
-    return [r for r in out if start <= r["date"] <= end]
+    return out
 
 
 def build_hs300_filter(index_rows: List[Dict[str, Any]]) -> Dict[str, bool]:
@@ -966,8 +1003,9 @@ def main() -> None:
     else:
         print("[3.5/5] 加载沪深300环境过滤...")
         hs300_rows = load_hs300_history(start, end, args.cache_dir)
+        print(f"沪深300数据条数: {len(hs300_rows)}")
         if not hs300_rows:
-            print("[WARN] 沪深300指数数据为空，市场过滤可能失效。")
+            raise RuntimeError("沪深300指数数据为空，停止回测")
         hs300_allow = build_hs300_filter(hs300_rows)
         aligned_hs300_allow = align_regime_filter_to_trade_days(trading_days, hs300_allow)
 
