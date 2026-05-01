@@ -261,12 +261,12 @@ def pick_stock_for_day(
     name_map: Dict[str, str],
     mode: str = "loose_hold3",
 ) -> List[str]:
-    """按日选股（row-by-date），支持 loose_hold3 / momentum_hold3_v1 / momentum_hold3_v2 / momentum_hold3_v3 / momentum_hold3_v4 / momentum_hold3_v5 / momentum_hold3_v7 / momentum_hold3_v8。"""
+    """按日选股（row-by-date），支持 loose_hold3 / momentum_hold3_v1 / momentum_hold3_v2 / momentum_hold3_v3 / momentum_hold3_v4 / momentum_hold3_v5 / momentum_hold3_v7 / momentum_hold3_v8 / momentum_hold3_v9。"""
     current_date = _normalize_yyyymmdd(day)
     picked: List[str] = []
     if mode == "momentum_hold3_v2":
         max_picks = 1
-    elif mode in ("momentum_hold3_v1", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"):
+    elif mode in ("momentum_hold3_v1", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9"):
         max_picks = 2
     else:
         max_picks = 3
@@ -294,7 +294,7 @@ def pick_stock_for_day(
         if math.isnan(close) or math.isnan(ma20):
             continue
 
-        if mode in ("momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"):
+        if mode in ("momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9"):
             if math.isnan(ma60) or math.isnan(vol_ma5):
                 continue
             if idx < 3:
@@ -315,6 +315,13 @@ def pick_stock_for_day(
                     continue
                 if vol_ma5 <= 0 or volume <= vol_ma5 * 1.2:
                     continue
+            elif mode == "momentum_hold3_v9":
+                if not (2.0 <= pct_chg <= 6.0):
+                    continue
+                if amount <= 300000000:
+                    continue
+                if vol_ma5 <= 0 or volume <= vol_ma5 * 1.3:
+                    continue
             elif mode in ("momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"):
                 if not (1.5 <= pct_chg <= 5.5):
                     continue
@@ -334,7 +341,7 @@ def pick_stock_for_day(
             if day_range <= 0:
                 continue
             close_pos = (close - low) / day_range
-            if mode == "momentum_hold3_v2":
+            if mode in ("momentum_hold3_v2", "momentum_hold3_v9"):
                 if close_pos <= 0.7:
                     continue
             elif close_pos <= 0.65:
@@ -344,11 +351,19 @@ def pick_stock_for_day(
             if prev3_close <= 0:
                 continue
             ret3 = (close / prev3_close - 1.0) * 100.0
-            if mode in ("momentum_hold3_v2", "momentum_hold3_v3"):
+            if mode == "momentum_hold3_v9":
+                if ret3 >= 7:
+                    continue
+            elif mode in ("momentum_hold3_v2", "momentum_hold3_v3"):
                 if ret3 >= 8:
                     continue
             elif ret3 >= 9:
                 continue
+            if mode == "momentum_hold3_v9":
+                p1 = _to_float(rows[idx - 1].get("pct_chg", 0))
+                p2 = _to_float(rows[idx - 2].get("pct_chg", 0))
+                if p1 > 0 and p2 > 0:
+                    continue
             if mode == "momentum_hold3_v3":
                 p1 = _to_float(rows[idx - 1].get("pct_chg", 0))
                 p2 = _to_float(rows[idx - 2].get("pct_chg", 0))
@@ -443,7 +458,7 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, 
         ret = _apply_cost((sell_price / buy_price - 1.0), fee_rate, slippage)
         return TradeRecord(symbol, rows[buy_idx]["date"], sell_date, buy_price, sell_price, ret, mode, exit_reason)
 
-    if mode == "momentum_hold3_v5":
+    if mode in ("momentum_hold3_v5", "momentum_hold3_v9"):
         sl_price = buy_price * 0.97
         last_idx = min(len(rows) - 1, buy_idx + 4)  # 最多持有5天（含买入日）
         sell_date = rows[last_idx]["date"]
@@ -836,8 +851,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["momentum_hold3_v1", "momentum_hold3_v5", "momentum_hold3_v8"],
-        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"],
+        default=["momentum_hold3_v1", "momentum_hold3_v5", "momentum_hold3_v9"],
+        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9"],
         help="sell mode",
     )
     parser.add_argument("--limit-300", action="store_true", help="use hs300 universe")
@@ -923,7 +938,7 @@ def main() -> None:
             skipped_bear_days += 1
             continue
         for mode in modes:
-            if mode not in ("loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"):
+            if mode not in ("loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9"):
                 continue
             picks = pick_stock_for_day(day, universe_data, name_map, mode=mode)
             if not picks:
