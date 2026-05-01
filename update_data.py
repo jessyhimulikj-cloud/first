@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta
 from pathlib import Path
 
-from data_loader import load_history
+from tushare_data_loader import load_history_tushare
 
 
 fallback_symbols = [
@@ -61,11 +60,6 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=31 * args.months)
-    start = start_dt.strftime("%Y%m%d")
-    end = end_dt.strftime("%Y%m%d")
-
     symbols = fallback_symbols[: args.universe_size] if args.universe_size > 0 else fallback_symbols
 
     success_count = 0
@@ -76,7 +70,7 @@ if __name__ == "__main__":
         if csv_path.exists():
             skipped_count += 1
             continue
-        df = load_history(symbol, start, end, data_dir=args.data_dir)
+        df = load_history_tushare(symbol, months=args.months, data_dir=args.data_dir)
         if df.empty:
             fail_count += 1
         else:
