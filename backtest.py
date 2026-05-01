@@ -24,15 +24,7 @@ from typing import Any, Dict, List
 import csv
 
 from stock_picker import _is_excluded_stock, _normalize_ts_code, robust_zscores
-
-fallback_symbols = [
-    "000001", "000002", "000063", "000333", "000651",
-    "000725", "002129", "002230", "002241", "002475",
-    "002594", "002714", "300014", "300015", "300059",
-    "300122", "300274", "300750", "300760", "300782",
-    "600000", "600009", "600030", "600036", "600050",
-    "600276", "600309", "600519", "600887", "601012",
-]
+from update_data import fallback_symbols
 
 
 @dataclass
@@ -103,10 +95,20 @@ def _em_session() -> Any:
     return session
 
 
-def load_universe(cache_dir: Path, size: int = 50) -> List[str]:
-    """使用固定股票池，并覆盖写入缓存文件。"""
+def load_universe(cache_dir: Path, size: int = 50, data_dir: Path = Path("data")) -> List[str]:
+    """使用与 update_data.py 一致的股票池，并优先使用 data 目录已有 CSV。"""
     cache_file = cache_dir / f"universe_{size}.csv"
-    symbols = fallback_symbols[:size] if size > 0 else fallback_symbols
+    csv_symbols = set()
+    if data_dir.exists():
+        for p in data_dir.glob("*.csv"):
+            code = p.stem.strip()
+            if len(code) == 6 and code.isdigit():
+                csv_symbols.add(code)
+
+    ordered_from_csv = [s for s in fallback_symbols if s in csv_symbols]
+    ordered_from_fallback = [s for s in fallback_symbols if s not in csv_symbols]
+    all_candidates = ordered_from_csv + ordered_from_fallback
+    symbols = all_candidates[:size] if size > 0 else all_candidates
     code_name_pairs = [(s, s) for s in symbols]
     codes = list(symbols)
 
@@ -897,7 +899,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["multi_strategy_v1"],
+        default=["momentum_hold3_v1", "momentum_hold3_v5", "multi_strategy_v1"],
         choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9", "multi_strategy_v1"],
         help="sell mode",
     )
@@ -921,8 +923,12 @@ def main() -> None:
     end = end_dt.strftime("%Y%m%d")
 
     print(f"[1/5] 加载股票池（start={start}, end={end}）...")
-    universe = load_universe(args.cache_dir, size=args.universe_size)
+    data_dir = Path("data")
+    universe = load_universe(args.cache_dir, size=args.universe_size, data_dir=data_dir)
+    data_csv_count = len(list(data_dir.glob("*.csv"))) if data_dir.exists() else 0
     print(f"股票池数量: {len(universe)}")
+    print(f"实际股票池数量: {len(universe)}")
+    print(f"data目录CSV数量: {data_csv_count}")
 
     print("[2/5] 加载历史数据（带缓存）...")
     universe_data: Dict[str, List[Dict[str, Any]]] = {}
