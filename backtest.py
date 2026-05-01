@@ -261,12 +261,12 @@ def pick_stock_for_day(
     name_map: Dict[str, str],
     mode: str = "loose_hold3",
 ) -> List[str]:
-    """按日选股（row-by-date），支持 loose_hold3 / momentum_hold3_v1 / momentum_hold3_v2 / momentum_hold3_v3。"""
+    """按日选股（row-by-date），支持 loose_hold3 / momentum_hold3_v1 / momentum_hold3_v2 / momentum_hold3_v3 / momentum_hold3_v4。"""
     current_date = _normalize_yyyymmdd(day)
     picked: List[str] = []
     if mode == "momentum_hold3_v2":
         max_picks = 1
-    elif mode in ("momentum_hold3_v1", "momentum_hold3_v3"):
+    elif mode in ("momentum_hold3_v1", "momentum_hold3_v3", "momentum_hold3_v4"):
         max_picks = 2
     else:
         max_picks = 3
@@ -294,7 +294,7 @@ def pick_stock_for_day(
         if math.isnan(close) or math.isnan(ma20):
             continue
 
-        if mode in ("momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3"):
+        if mode in ("momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4"):
             if math.isnan(ma60) or math.isnan(vol_ma5):
                 continue
             if idx < 3:
@@ -309,6 +309,13 @@ def pick_stock_for_day(
                 if vol_ma5 <= 0 or volume <= vol_ma5 * 1.3:
                     continue
             elif mode == "momentum_hold3_v3":
+                if not (1.5 <= pct_chg <= 5.5):
+                    continue
+                if amount <= 300000000:
+                    continue
+                if vol_ma5 <= 0 or volume <= vol_ma5 * 1.2:
+                    continue
+            elif mode == "momentum_hold3_v4":
                 if not (1.5 <= pct_chg <= 5.5):
                     continue
                 if amount <= 300000000:
@@ -381,6 +388,60 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, 
     buy_price = next_open
     if buy_price <= 0:
         return None
+
+    if mode == "momentum_hold3_v4":
+        sl_price = buy_price * 0.975
+        last_idx = min(len(rows) - 1, buy_idx + 2)
+        sell_date = rows[last_idx]["date"]
+        sell_price = _to_float(rows[last_idx].get("close", 0))
+        exit_reason = "timeout_exit"
+        trail_armed = False
+        peak_price = buy_price
+
+        for i in range(buy_idx, last_idx + 1):
+            day = rows[i]
+            high = _to_float(day.get("high", 0))
+            low = _to_float(day.get("low", 0))
+            close_i = _to_float(day.get("close", 0))
+
+            if high > peak_price:
+                peak_price = high
+
+            # 提前止盈：买入后第2天涨幅 > 4% 直接卖出
+            if i == buy_idx + 1 and close_i > 0 and (close_i / buy_price - 1.0) > 0.04:
+                sell_date = day["date"]
+                sell_price = close_i
+                exit_reason = "stop_profit"
+                break
+
+            # 固定止损 -2.5%
+            if low > 0 and low <= sl_price:
+                sell_date = day["date"]
+                sell_price = sl_price
+                exit_reason = "stop_loss"
+                break
+
+            # 盈利达到 +3% 启动跟踪止盈
+            if not trail_armed and high >= buy_price * 1.03:
+                trail_armed = True
+            if trail_armed and peak_price > 0 and close_i > 0:
+                dd_from_peak = (peak_price - close_i) / peak_price
+                if dd_from_peak > 0.015:
+                    sell_date = day["date"]
+                    sell_price = close_i
+                    exit_reason = "stop_profit"
+                    break
+
+            # 时间止损：持有超过3天仍未盈利（此分支对应持有窗口末日）
+            if i == last_idx and close_i > 0:
+                sell_date = day["date"]
+                sell_price = close_i
+                exit_reason = "timeout_exit" if close_i <= buy_price else "stop_profit"
+
+        if sell_price <= 0:
+            return None
+        ret = _apply_cost((sell_price / buy_price - 1.0), fee_rate, slippage)
+        return TradeRecord(symbol, rows[buy_idx]["date"], sell_date, buy_price, sell_price, ret, mode, exit_reason)
 
     if mode in ("tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "momentum_hold3_v2", "momentum_hold3_v3"):
         tp_price = buy_price * (1.06 if mode == "momentum_hold3_v3" else 1.05)
@@ -594,8 +655,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3"],
-        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3"],
+        default=["momentum_hold3_v1", "momentum_hold3_v4"],
+        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4"],
         help="sell mode",
     )
     parser.add_argument("--limit-300", action="store_true", help="use hs300 universe")
@@ -681,7 +742,7 @@ def main() -> None:
             skipped_bear_days += 1
             continue
         for mode in modes:
-            if mode not in ("loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3"):
+            if mode not in ("loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4"):
                 continue
             picks = pick_stock_for_day(day, universe_data, name_map, mode=mode)
             if not picks:
