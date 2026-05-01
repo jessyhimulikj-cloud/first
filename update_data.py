@@ -65,16 +65,26 @@ if __name__ == "__main__":
     success_count = 0
     fail_count = 0
     skipped_count = 0
-    for symbol in symbols:
+    total = len(symbols)
+    for i, symbol in enumerate(symbols, start=1):
         csv_path = args.data_dir / f"{symbol}.csv"
         if csv_path.exists():
             skipped_count += 1
+            print(f"[{i}/{total}] {symbol} 已存在，跳过")
+            print(f"  已跳过={skipped_count} 新下载成功={success_count} 失败={fail_count}")
             continue
-        df = load_history_tushare(symbol, months=args.months, data_dir=args.data_dir)
-        if df.empty:
+        try:
+            df = load_history_tushare(symbol, months=args.months, data_dir=args.data_dir, max_retries=3, request_interval=0.4)
+            if df.empty:
+                fail_count += 1
+                print(f"[{i}/{total}] {symbol} 下载为空")
+            else:
+                success_count += 1
+                print(f"[{i}/{total}] {symbol} 下载成功")
+        except Exception as exc:
             fail_count += 1
-        else:
-            success_count += 1
+            print(f"[{i}/{total}] {symbol} 下载失败: {exc}")
+        print(f"  已跳过={skipped_count} 新下载成功={success_count} 失败={fail_count}")
 
     print(f"已存在跳过数量: {skipped_count}")
     print(f"新下载成功数量: {success_count}")

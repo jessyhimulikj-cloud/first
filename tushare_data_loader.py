@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,18 @@ def _to_ts_code(symbol: str) -> str:
     raise ValueError(f"不支持的 symbol 前缀: {symbol}")
 
 
-def load_history_tushare(symbol: str, months: int = 12, data_dir: Path | str = "data") -> Any:
+def _is_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return ("频率" in str(exc)) or ("rate limit" in msg) or ("too many requests" in msg)
+
+
+def load_history_tushare(
+    symbol: str,
+    months: int = 12,
+    data_dir: Path | str = "data",
+    max_retries: int = 3,
+    request_interval: float = 0.4,
+) -> Any:
     pd = _import_pandas()
     data_path = Path(data_dir)
     data_path.mkdir(parents=True, exist_ok=True)
@@ -60,7 +72,25 @@ def load_history_tushare(symbol: str, months: int = 12, data_dir: Path | str = "
     end_date = end_dt.strftime("%Y%m%d")
     start_date = start_dt.strftime("%Y%m%d")
 
-    df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+    last_exc: Exception | None = None
+    df = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+            time.sleep(request_interval)
+            break
+        except Exception as exc:
+            last_exc = exc
+            if _is_rate_limit_error(exc):
+                time.sleep(10)
+            else:
+                time.sleep(request_interval)
+            if attempt >= max_retries:
+                raise RuntimeError(f"Tushare 下载失败: {symbol}") from exc
+            continue
+
+    if df is None and last_exc is not None:
+        raise RuntimeError(f"Tushare 下载失败: {symbol}") from last_exc
     if df is None or df.empty:
         return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "amount", "pct_chg"])
 
@@ -85,4 +115,3 @@ def load_history_tushare(symbol: str, months: int = 12, data_dir: Path | str = "
     df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     df.to_csv(csv_path, index=False, encoding="utf-8")
     return df
-
