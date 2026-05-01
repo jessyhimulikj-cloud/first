@@ -45,6 +45,6 @@ def test_parse_args_defaults(monkeypatch):
     assert args.months == 3
     assert args.universe_size == 30
     assert args.max_days == 60
-    assert args.modes == ["momentum_hold3_v1", "momentum_hold3_v5", "momentum_hold3_v7"]
+    assert args.modes == ["momentum_hold3_v1", "momentum_hold3_v5", "momentum_hold3_v8"]
     assert args.fee_rate == 0.003
     assert args.slippage == 0.001

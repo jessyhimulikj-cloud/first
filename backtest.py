@@ -261,12 +261,12 @@ def pick_stock_for_day(
     name_map: Dict[str, str],
     mode: str = "loose_hold3",
 ) -> List[str]:
-    """按日选股（row-by-date），支持 loose_hold3 / momentum_hold3_v1 / momentum_hold3_v2 / momentum_hold3_v3 / momentum_hold3_v4 / momentum_hold3_v5 / momentum_hold3_v7。"""
+    """按日选股（row-by-date），支持 loose_hold3 / momentum_hold3_v1 / momentum_hold3_v2 / momentum_hold3_v3 / momentum_hold3_v4 / momentum_hold3_v5 / momentum_hold3_v7 / momentum_hold3_v8。"""
     current_date = _normalize_yyyymmdd(day)
     picked: List[str] = []
     if mode == "momentum_hold3_v2":
         max_picks = 1
-    elif mode in ("momentum_hold3_v1", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7"):
+    elif mode in ("momentum_hold3_v1", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"):
         max_picks = 2
     else:
         max_picks = 3
@@ -294,7 +294,7 @@ def pick_stock_for_day(
         if math.isnan(close) or math.isnan(ma20):
             continue
 
-        if mode in ("momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7"):
+        if mode in ("momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"):
             if math.isnan(ma60) or math.isnan(vol_ma5):
                 continue
             if idx < 3:
@@ -315,7 +315,7 @@ def pick_stock_for_day(
                     continue
                 if vol_ma5 <= 0 or volume <= vol_ma5 * 1.2:
                     continue
-            elif mode in ("momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7"):
+            elif mode in ("momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"):
                 if not (1.5 <= pct_chg <= 5.5):
                     continue
                 if amount <= 300000000:
@@ -550,6 +550,80 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, 
         ret = _apply_cost((sell_price / buy_price - 1.0), fee_rate, slippage)
         return TradeRecord(symbol, rows[buy_idx]["date"], sell_date, buy_price, sell_price, ret, mode, exit_reason)
 
+    if mode == "momentum_hold3_v8":
+        sl_price = buy_price * 0.97
+        peak_price = buy_price
+        protect_mode = False
+        down_streak = 0
+        prev_close = buy_price
+        last_idx = min(len(rows) - 1, buy_idx + 7)  # 最大持仓8天（含买入日）
+        sell_date = rows[last_idx]["date"]
+        sell_price = _to_float(rows[last_idx].get("close", 0))
+        exit_reason = "timeout_exit"
+
+        for i in range(buy_idx, last_idx + 1):
+            day = rows[i]
+            low = _to_float(day.get("low", 0))
+            high = _to_float(day.get("high", 0))
+            close_i = _to_float(day.get("close", 0))
+            if close_i <= 0:
+                continue
+
+            if high > peak_price:
+                peak_price = high
+
+            # 固定止损 -3%
+            if low > 0 and low <= sl_price:
+                sell_date = day["date"]
+                sell_price = sl_price
+                exit_reason = "stop_loss"
+                break
+
+            # 浮盈 >5% 启动保护，回撤 >2.5% 卖出
+            if (close_i / buy_price - 1.0) > 0.05:
+                protect_mode = True
+            if protect_mode and peak_price > 0:
+                drawdown = (peak_price - close_i) / peak_price
+                if drawdown > 0.025:
+                    sell_date = day["date"]
+                    sell_price = close_i
+                    exit_reason = "stop_profit"
+                    break
+
+            # 趋势退出放宽：收盘价 < ma10 才卖
+            if i >= 9:
+                window10 = rows[i - 9 : i + 1]
+                ma10_now = sum(_to_float(x.get("close", 0)) for x in window10) / 10.0
+                if close_i < ma10_now:
+                    sell_date = day["date"]
+                    sell_price = close_i
+                    exit_reason = "stop_profit"
+                    break
+
+            # 弱势退出放宽：连续3天下跌
+            if close_i < prev_close:
+                down_streak += 1
+            else:
+                down_streak = 0
+            if down_streak >= 3:
+                sell_date = day["date"]
+                sell_price = close_i
+                exit_reason = "stop_profit"
+                break
+
+            prev_close = close_i
+
+            # 第8天仍持仓则强制卖出
+            if i == last_idx:
+                sell_date = day["date"]
+                sell_price = close_i
+                exit_reason = "timeout_exit"
+
+        if sell_price <= 0:
+            return None
+        ret = _apply_cost((sell_price / buy_price - 1.0), fee_rate, slippage)
+        return TradeRecord(symbol, rows[buy_idx]["date"], sell_date, buy_price, sell_price, ret, mode, exit_reason)
+
     if mode in ("tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "momentum_hold3_v2", "momentum_hold3_v3"):
         tp_price = buy_price * (1.06 if mode == "momentum_hold3_v3" else 1.05)
         sl_price = buy_price * 0.97
@@ -762,8 +836,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["momentum_hold3_v1", "momentum_hold3_v5", "momentum_hold3_v7"],
-        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7"],
+        default=["momentum_hold3_v1", "momentum_hold3_v5", "momentum_hold3_v8"],
+        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"],
         help="sell mode",
     )
     parser.add_argument("--limit-300", action="store_true", help="use hs300 universe")
@@ -849,7 +923,7 @@ def main() -> None:
             skipped_bear_days += 1
             continue
         for mode in modes:
-            if mode not in ("loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7"):
+            if mode not in ("loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"):
                 continue
             picks = pick_stock_for_day(day, universe_data, name_map, mode=mode)
             if not picks:
