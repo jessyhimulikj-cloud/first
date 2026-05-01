@@ -146,6 +146,7 @@ def load_symbol_history(symbol: str, start: str, end: str, cache_dir: Path) -> L
                 "close": _to_float(row.get("close", 0)),
                 "volume": _to_float(row.get("volume", 0)),
                 "amount": _to_float(row.get("amount", 0)),
+                "amount_yuan": _to_float(row.get("amount", 0)) * 1000.0,
                 "pct_chg": _to_float(row.get("pct_chg", 0)),
             }
         )
@@ -286,6 +287,7 @@ def pick_stock_for_day(
             ma60 = float(r["ma60"])
             pct_chg = float(r["pct_chg"])
             amount = float(r["amount"])
+            amount_yuan = float(r.get("amount_yuan", amount * 1000.0))
             volume = float(r["volume"])
             vol_ma5 = float(r["vol_ma5"])
             high = float(r["high"])
@@ -306,35 +308,35 @@ def pick_stock_for_day(
             if mode == "momentum_hold3_v2":
                 if not (2.0 <= pct_chg <= 6.0):
                     continue
-                if amount <= 500000000:
+                if amount_yuan <= 500000000:
                     continue
                 if vol_ma5 <= 0 or volume <= vol_ma5 * 1.3:
                     continue
             elif mode == "momentum_hold3_v3":
                 if not (1.5 <= pct_chg <= 5.5):
                     continue
-                if amount <= 300000000:
+                if amount_yuan <= 300000000:
                     continue
                 if vol_ma5 <= 0 or volume <= vol_ma5 * 1.2:
                     continue
             elif mode == "momentum_hold3_v9":
                 if not (2.0 <= pct_chg <= 6.0):
                     continue
-                if amount <= 300000000:
+                if amount_yuan <= 300000000:
                     continue
                 if vol_ma5 <= 0 or volume <= vol_ma5 * 1.3:
                     continue
             elif mode in ("momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"):
                 if not (1.5 <= pct_chg <= 5.5):
                     continue
-                if amount <= 300000000:
+                if amount_yuan <= 300000000:
                     continue
                 if vol_ma5 <= 0 or volume <= vol_ma5 * 1.2:
                     continue
             else:
                 if not (1.5 <= pct_chg <= 5.5):
                     continue
-                if amount <= 300000000:
+                if amount_yuan <= 300000000:
                     continue
                 if vol_ma5 <= 0 or volume <= vol_ma5 * 1.2:
                     continue
@@ -373,7 +375,7 @@ def pick_stock_for_day(
                 if p1 > 0 and p2 > 0 and p3 > 0:
                     continue
             picked.append(symbol)
-        elif close > ma20 and pct_chg > 0 and amount > 100000000:
+        elif close > ma20 and pct_chg > 0 and amount_yuan > 100000000:
             picked.append(symbol)
         if len(picked) >= max_picks:
             break
@@ -949,6 +951,14 @@ def main() -> None:
     print(f"成功加载股票数: {len(success_symbols)}")
     print(f"失败股票数: {len(failed_symbols)}")
     print(f"前3个成功股票代码: {success_symbols[:3]}")
+    if success_symbols:
+        sample_symbol = success_symbols[0]
+        sample_row = universe_data[sample_symbol][-1]
+        print(
+            f"[diag-amount] symbol={sample_symbol} "
+            f"amount={sample_row.get('amount', 0)} "
+            f"amount_yuan={sample_row.get('amount_yuan', 0)}"
+        )
 
     if not universe_data:
         raise RuntimeError("无可用历史数据，请检查网络或 akshare")
