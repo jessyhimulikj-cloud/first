@@ -378,6 +378,52 @@ def pick_stock_for_day(
     return picked
 
 
+def _score_symbol_for_day(symbol: str, day: str, universe_data: Dict[str, List[Dict[str, Any]]]) -> float:
+    rows = universe_data.get(symbol, [])
+    idx = next((i for i, r in enumerate(rows) if _normalize_yyyymmdd(r.get("date", "")) == _normalize_yyyymmdd(day)), -1)
+    if idx < 0:
+        return -1e18
+    row = rows[idx]
+    pct_chg = _to_float(row.get("pct_chg", 0))
+    volume = _to_float(row.get("volume", 0))
+    return pct_chg + volume / 1e8
+
+
+def pick_multi_strategy_v1(day: str, universe_data: Dict[str, List[Dict[str, Any]]], name_map: Dict[str, str]) -> Dict[str, str]:
+    """
+    组合策略：
+    - 优先 v5 信号，否则 v1
+    - 若两者同时有信号，按 (pct_chg + volume) 评分排序
+    - 每天最多 2 只
+    返回: symbol -> strategy_mode(v1/v5)
+    """
+    v5 = pick_stock_for_day(day, universe_data, name_map, mode="momentum_hold3_v5")
+    v1 = pick_stock_for_day(day, universe_data, name_map, mode="momentum_hold3_v1")
+    if not v5 and not v1:
+        return {}
+
+    if v5 and not v1:
+        return {s: "momentum_hold3_v5" for s in v5[:2]}
+    if v1 and not v5:
+        return {s: "momentum_hold3_v1" for s in v1[:2]}
+
+    union = list(dict.fromkeys(v5 + v1))
+    scored = []
+    for s in union:
+        scored.append(
+            (
+                s,
+                _score_symbol_for_day(s, day, universe_data),
+                1 if s in v5 else 0,
+            )
+        )
+    scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    out: Dict[str, str] = {}
+    for s, _, _ in scored[:2]:
+        out[s] = "momentum_hold3_v5" if s in v5 else "momentum_hold3_v1"
+    return out
+
+
 def _apply_cost(raw_ret: float, fee_rate: float, slippage: float) -> float:
     """交易成本：手续费(总) + 双边滑点。"""
     return raw_ret - (fee_rate + 2 * slippage)
@@ -851,8 +897,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["momentum_hold3_v1", "momentum_hold3_v5", "momentum_hold3_v9"],
-        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9"],
+        default=["multi_strategy_v1"],
+        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9", "multi_strategy_v1"],
         help="sell mode",
     )
     parser.add_argument("--limit-300", action="store_true", help="use hs300 universe")
@@ -938,6 +984,22 @@ def main() -> None:
             skipped_bear_days += 1
             continue
         for mode in modes:
+            if mode == "multi_strategy_v1":
+                picked_modes = pick_multi_strategy_v1(day, universe_data, name_map)
+                for symbol, real_mode in picked_modes.items():
+                    rows = universe_data.get(symbol, [])
+                    day_idx = next((i for i, r in enumerate(rows) if r["date"] == day), -1)
+                    if day_idx < 0:
+                        continue
+                    try:
+                        tr = run_trade(symbol, day_idx, rows, real_mode, args.fee_rate, args.slippage)
+                        if tr:
+                            tr.mode = mode
+                            mode_trades[mode].append(tr)
+                    except Exception:
+                        continue
+                continue
+
             if mode not in ("loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9"):
                 continue
             picks = pick_stock_for_day(day, universe_data, name_map, mode=mode)
