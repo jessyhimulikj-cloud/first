@@ -892,9 +892,9 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=["akshare", "eastmoney"], default="akshare", help="data source")
-    parser.add_argument("--months", type=int, default=3, help="backtest months")
+    parser.add_argument("--months", type=int, default=12, help="backtest months")
     parser.add_argument("--universe-size", type=int, default=30, help="stock universe size")
-    parser.add_argument("--max-days", type=int, default=60, help="max trading days")
+    parser.add_argument("--max-days", type=int, default=0, help="max trading days")
     parser.add_argument("--fee-rate", type=float, default=0.003, help="transaction fee")
     parser.add_argument("--slippage", type=float, default=0.001, help="slippage")
     parser.add_argument("--regime-confirm-days", type=int, default=3, help="regime weak confirmation days")
@@ -923,6 +923,8 @@ def main() -> None:
     start_dt = end_dt - timedelta(days=31 * args.months + 10)
     start = start_dt.strftime("%Y%m%d")
     end = end_dt.strftime("%Y%m%d")
+    print(f"backtest_start: {start}")
+    print(f"backtest_end: {end}")
 
     print(f"[1/5] 加载股票池（start={start}, end={end}）...")
     data_dir = Path("data")

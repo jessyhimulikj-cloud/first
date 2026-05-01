@@ -42,9 +42,9 @@ def test_run_trade_gap_filter():
 def test_parse_args_defaults(monkeypatch):
     monkeypatch.setattr("sys.argv", ["backtest.py"])
     args = parse_args()
-    assert args.months == 3
+    assert args.months == 12
     assert args.universe_size == 30
-    assert args.max_days == 60
+    assert args.max_days == 0
     assert args.modes == ["momentum_hold3_v1", "momentum_hold3_v5", "multi_strategy_v1"]
     assert args.fee_rate == 0.003
     assert args.slippage == 0.001
