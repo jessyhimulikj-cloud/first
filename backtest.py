@@ -200,32 +200,24 @@ def load_hs300_history(start: str, end: str, cache_dir: Path) -> List[Dict[str, 
     return [r for r in out if start <= r["date"] <= end]
 
 
-def build_hs300_filter(index_rows: List[Dict[str, Any]], confirm_days: int = 3) -> Dict[str, bool]:
-    """
-    返回 date -> 是否允许交易。
-    规则：
-    - 弱势定义：close < ma20
-    - 若连续 confirm_days 天弱势，则判定为空仓（当天不交易）
-    """
+def build_hs300_filter(index_rows: List[Dict[str, Any]]) -> Dict[str, bool]:
+    """返回 date -> allow（True可交易），弱势条件：close<MA10 or MA5<MA10 or MA10<MA20。"""
     if not index_rows:
         return {}
     rows = sorted(index_rows, key=lambda x: x["date"])
     allow: Dict[str, bool] = {}
     closes: List[float] = []
-    weak_flags: List[bool] = []
     for r in rows:
         closes.append(float(r["close"]))
         if len(closes) < 20:
             allow[r["date"]] = True
-        else:
-            ma20 = sum(closes[-20:]) / 20.0
-            weak_today = float(r["close"]) < ma20
-            weak_flags.append(weak_today)
-            if confirm_days <= 1:
-                allow[r["date"]] = not weak_today
-            else:
-                recent = weak_flags[-confirm_days:]
-                allow[r["date"]] = not (len(recent) == confirm_days and all(recent))
+            continue
+        ma5 = sum(closes[-5:]) / 5.0
+        ma10 = sum(closes[-10:]) / 10.0
+        ma20 = sum(closes[-20:]) / 20.0
+        close = float(r["close"])
+        weak_today = (close < ma10) or (ma5 < ma10) or (ma10 < ma20)
+        allow[r["date"]] = not weak_today
     return allow
 
 
@@ -974,7 +966,9 @@ def main() -> None:
     else:
         print("[3.5/5] 加载沪深300环境过滤...")
         hs300_rows = load_hs300_history(start, end, args.cache_dir)
-        hs300_allow = build_hs300_filter(hs300_rows, confirm_days=args.regime_confirm_days)
+        if not hs300_rows:
+            print("[WARN] 沪深300指数数据为空，市场过滤可能失效。")
+        hs300_allow = build_hs300_filter(hs300_rows)
         aligned_hs300_allow = align_regime_filter_to_trade_days(trading_days, hs300_allow)
 
     # 名称映射（用实时快照，失败则用代码）
@@ -997,6 +991,18 @@ def main() -> None:
         return not aligned_hs300_allow.get(day, True)
 
     for idx, day in enumerate(trade_days[:-6]):
+        if idx < 5:
+            hs_row = next((r for r in hs300_rows if r.get("date") == day), None) if not args.no_market_filter else None
+            if hs_row:
+                hs_closes = [float(x["close"]) for x in hs300_rows if x["date"] <= day]
+                ma5 = sum(hs_closes[-5:]) / 5.0 if len(hs_closes) >= 5 else float("nan")
+                ma10 = sum(hs_closes[-10:]) / 10.0 if len(hs_closes) >= 10 else float("nan")
+                ma20 = sum(hs_closes[-20:]) / 20.0 if len(hs_closes) >= 20 else float("nan")
+                weak_today = not aligned_hs300_allow.get(day, True)
+                print(
+                    f"[market-debug] date={day} close={hs_row.get('close')} "
+                    f"MA5={ma5:.3f} MA10={ma10:.3f} MA20={ma20:.3f} weak={weak_today}"
+                )
         if is_bear_market(day):
             print(f"{day} 跳过（弱势市场）")
             skipped_bear_days += 1
