@@ -292,6 +292,7 @@ def pick_stock_for_day(
     universe_data: Dict[str, List[Dict[str, Any]]],
     name_map: Dict[str, str],
     mode: str = "loose_hold3",
+    param_cfg: Dict[str, float] | None = None,
 ) -> List[str]:
     """按日选股（row-by-date），支持 loose_hold3 / momentum_hold3_v1 / momentum_hold3_v2 / momentum_hold3_v3 / momentum_hold3_v4 / momentum_hold3_v5 / momentum_hold3_v7 / momentum_hold3_v8 / momentum_hold3_v9。"""
     current_date = _normalize_yyyymmdd(day)
@@ -299,6 +300,8 @@ def pick_stock_for_day(
     if mode == "momentum_hold3_v2":
         max_picks = 1
     elif mode in ("momentum_hold3_v1", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9"):
+        max_picks = 2
+    elif mode == "param_mode_v1":
         max_picks = 2
     else:
         max_picks = 3
@@ -327,7 +330,7 @@ def pick_stock_for_day(
         if math.isnan(close) or math.isnan(ma20):
             continue
 
-        if mode in ("momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9"):
+        if mode in ("momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9", "param_mode_v1"):
             if math.isnan(ma60) or math.isnan(vol_ma5):
                 continue
             if idx < 3:
@@ -355,6 +358,17 @@ def pick_stock_for_day(
                     continue
                 if vol_ma5 <= 0 or volume <= vol_ma5 * 1.3:
                     continue
+            elif mode == "param_mode_v1":
+                cfg = param_cfg or {}
+                pct_min = float(cfg.get("pct_min", 2.0))
+                pct_max = float(cfg.get("pct_max", 6.0))
+                volume_ratio = float(cfg.get("volume_ratio", 1.5))
+                if not (pct_min <= pct_chg <= pct_max):
+                    continue
+                if amount_yuan <= 300000000:
+                    continue
+                if vol_ma5 <= 0 or volume <= vol_ma5 * volume_ratio:
+                    continue
             elif mode in ("momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8"):
                 if not (1.5 <= pct_chg <= 5.5):
                     continue
@@ -374,7 +388,7 @@ def pick_stock_for_day(
             if day_range <= 0:
                 continue
             close_pos = (close - low) / day_range
-            if mode in ("momentum_hold3_v2", "momentum_hold3_v9"):
+            if mode in ("momentum_hold3_v2", "momentum_hold3_v9", "param_mode_v1"):
                 if close_pos <= 0.7:
                     continue
             elif close_pos <= 0.65:
@@ -384,7 +398,7 @@ def pick_stock_for_day(
             if prev3_close <= 0:
                 continue
             ret3 = (close / prev3_close - 1.0) * 100.0
-            if mode == "momentum_hold3_v9":
+            if mode in ("momentum_hold3_v9", "param_mode_v1"):
                 if ret3 >= 7:
                     continue
             elif mode in ("momentum_hold3_v2", "momentum_hold3_v3"):
@@ -392,7 +406,7 @@ def pick_stock_for_day(
                     continue
             elif ret3 >= 9:
                 continue
-            if mode == "momentum_hold3_v9":
+            if mode in ("momentum_hold3_v9", "param_mode_v1"):
                 p1 = _to_float(rows[idx - 1].get("pct_chg", 0))
                 p2 = _to_float(rows[idx - 2].get("pct_chg", 0))
                 if p1 > 0 and p2 > 0:
@@ -462,7 +476,17 @@ def _apply_cost(raw_ret: float, fee_rate: float, slippage: float) -> float:
     return raw_ret - (fee_rate + 2 * slippage)
 
 
-def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, fee_rate: float, slippage: float) -> TradeRecord | None:
+def run_trade(
+    symbol: str,
+    day_idx: int,
+    rows: List[Dict[str, Any]],
+    mode: str,
+    fee_rate: float,
+    slippage: float,
+    hold_days: int = 3,
+    take_profit: float = 0.06,
+    stop_loss: float = 0.04,
+) -> TradeRecord | None:
     buy_idx = day_idx + 1
     if buy_idx >= len(rows):
         return None
@@ -482,6 +506,37 @@ def run_trade(symbol: str, day_idx: int, rows: List[Dict[str, Any]], mode: str, 
     buy_price = next_open
     if buy_price <= 0:
         return None
+
+    if mode == "param_mode_v1":
+        tp_price = buy_price * (1.0 + take_profit)
+        sl_price = buy_price * (1.0 - stop_loss)
+        last_idx = min(len(rows) - 1, buy_idx + max(1, hold_days) - 1)
+        sell_date = rows[last_idx]["date"]
+        sell_price = _to_float(rows[last_idx].get("close", 0))
+        exit_reason = "timeout_exit"
+        for i in range(buy_idx, last_idx + 1):
+            day = rows[i]
+            high = _to_float(day.get("high", 0))
+            low = _to_float(day.get("low", 0))
+            close_i = _to_float(day.get("close", 0))
+            if high > 0 and high >= tp_price:
+                sell_date = day["date"]
+                sell_price = tp_price
+                exit_reason = "stop_profit"
+                break
+            if low > 0 and low <= sl_price:
+                sell_date = day["date"]
+                sell_price = sl_price
+                exit_reason = "stop_loss"
+                break
+            if i == last_idx and close_i > 0:
+                sell_date = day["date"]
+                sell_price = close_i
+                exit_reason = "timeout_exit"
+        if sell_price <= 0:
+            return None
+        ret = _apply_cost((sell_price / buy_price - 1.0), fee_rate, slippage)
+        return TradeRecord(symbol, rows[buy_idx]["date"], sell_date, buy_price, sell_price, ret, mode, exit_reason)
 
     if mode == "momentum_hold3_v4":
         sl_price = buy_price * 0.975
@@ -927,11 +982,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fee-rate", type=float, default=0.003, help="transaction fee")
     parser.add_argument("--slippage", type=float, default=0.001, help="slippage")
     parser.add_argument("--regime-confirm-days", type=int, default=3, help="regime weak confirmation days")
+    parser.add_argument("--hold-days", type=int, default=3, help="param mode hold days")
+    parser.add_argument("--take-profit", type=float, default=0.06, help="param mode take profit ratio")
+    parser.add_argument("--stop-loss", type=float, default=0.04, help="param mode stop loss ratio")
+    parser.add_argument("--volume-ratio", type=float, default=1.5, help="param mode volume ratio")
+    parser.add_argument("--pct-min", type=float, default=2.0, help="param mode pct min")
+    parser.add_argument("--pct-max", type=float, default=6.0, help="param mode pct max")
     parser.add_argument(
         "--modes",
         nargs="+",
         default=["momentum_hold3_v1", "momentum_hold3_v5", "multi_strategy_v1"],
-        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9", "multi_strategy_v1"],
+        choices=["hold_3", "hold_5", "take_profit_stop_loss", "tp5_sl3_hold3", "strong_momentum_tp5_sl3_hold3", "loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9", "multi_strategy_v1", "param_mode_v1"],
         help="sell mode",
     )
     parser.add_argument("--limit-300", action="store_true", help="use hs300 universe")
@@ -992,7 +1053,20 @@ def main() -> None:
         )
 
     if not universe_data:
-        raise RuntimeError("无可用历史数据，请检查网络或 akshare")
+        print("[WARN] 无可用历史数据，输出空回测结果。")
+        empty_metrics = {m: calc_metrics([]) for m in args.modes}
+        save_result(args.output, empty_metrics)
+        print(f"回测完成，结果已输出: {args.output}")
+        for mode, m in empty_metrics.items():
+            print(
+                f"{mode}: trades={m['total_trades']}, win_rate={m['win_rate']:.2%}, "
+                f"avg_ret={m['avg_return']:.2%}, max_dd={m['max_drawdown']:.2%}, pl={m['profit_loss_ratio']:.2f}"
+            )
+            print(f"win_rate,{m['win_rate']:.4f}")
+            print(f"profit_loss_ratio,{m['profit_loss_ratio']:.4f}")
+            print(f"max_drawdown,{m['max_drawdown']:.4f}")
+            print(f"total_trades,{m['total_trades']}")
+        return
 
     print("[3/5] 构建交易日历...")
     trading_days = sorted({r["date"] for rows in universe_data.values() for r in rows})
@@ -1054,7 +1128,7 @@ def main() -> None:
                     if day_idx < 0:
                         continue
                     try:
-                        tr = run_trade(symbol, day_idx, rows, real_mode, args.fee_rate, args.slippage)
+                        tr = run_trade(symbol, day_idx, rows, real_mode, args.fee_rate, args.slippage, args.hold_days, args.take_profit, args.stop_loss)
                         if tr:
                             tr.mode = mode
                             mode_trades[mode].append(tr)
@@ -1062,9 +1136,16 @@ def main() -> None:
                         continue
                 continue
 
-            if mode not in ("loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9"):
+            if mode not in ("loose_hold3", "momentum_hold3_v1", "momentum_hold3_v2", "momentum_hold3_v3", "momentum_hold3_v4", "momentum_hold3_v5", "momentum_hold3_v7", "momentum_hold3_v8", "momentum_hold3_v9", "param_mode_v1"):
                 continue
-            picks = pick_stock_for_day(day, universe_data, name_map, mode=mode)
+            picks = pick_stock_for_day(
+                day, universe_data, name_map, mode=mode,
+                param_cfg={
+                    "pct_min": args.pct_min,
+                    "pct_max": args.pct_max,
+                    "volume_ratio": args.volume_ratio,
+                },
+            )
             if not picks:
                 continue
             for symbol in picks:
@@ -1073,7 +1154,7 @@ def main() -> None:
                 if day_idx < 0:
                     continue
                 try:
-                    tr = run_trade(symbol, day_idx, rows, mode, args.fee_rate, args.slippage)
+                    tr = run_trade(symbol, day_idx, rows, mode, args.fee_rate, args.slippage, args.hold_days, args.take_profit, args.stop_loss)
                     if tr:
                         mode_trades[mode].append(tr)
                 except Exception:
@@ -1093,6 +1174,10 @@ def main() -> None:
             f"{mode}: trades={m['total_trades']}, win_rate={m['win_rate']:.2%}, "
             f"avg_ret={m['avg_return']:.2%}, max_dd={m['max_drawdown']:.2%}, pl={m['profit_loss_ratio']:.2f}"
         )
+        print(f"win_rate,{m['win_rate']:.4f}")
+        print(f"profit_loss_ratio,{m['profit_loss_ratio']:.4f}")
+        print(f"max_drawdown,{m['max_drawdown']:.4f}")
+        print(f"total_trades,{m['total_trades']}")
 
 
 if __name__ == "__main__":
