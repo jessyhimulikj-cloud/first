@@ -363,9 +363,10 @@ def pick_stock_for_day(
                 pct_min = float(cfg.get("pct_min", 2.0))
                 pct_max = float(cfg.get("pct_max", 6.0))
                 volume_ratio = float(cfg.get("volume_ratio", 1.5))
+                amount_min = float(cfg.get("amount_min", 300000000))
                 if not (pct_min <= pct_chg <= pct_max):
                     continue
-                if amount_yuan <= 300000000:
+                if amount_yuan <= amount_min:
                     continue
                 if vol_ma5 <= 0 or volume <= vol_ma5 * volume_ratio:
                     continue
@@ -389,7 +390,8 @@ def pick_stock_for_day(
                 continue
             close_pos = (close - low) / day_range
             if mode in ("momentum_hold3_v2", "momentum_hold3_v9", "param_mode_v1"):
-                if close_pos <= 0.7:
+                close_pos_min = float((param_cfg or {}).get("close_pos_min", 0.7)) if mode == "param_mode_v1" else 0.7
+                if close_pos <= close_pos_min:
                     continue
             elif close_pos <= 0.65:
                 continue
@@ -399,7 +401,8 @@ def pick_stock_for_day(
                 continue
             ret3 = (close / prev3_close - 1.0) * 100.0
             if mode in ("momentum_hold3_v9", "param_mode_v1"):
-                if ret3 >= 7:
+                ret3_max = float((param_cfg or {}).get("ret3_max", 7.0)) if mode == "param_mode_v1" else 7.0
+                if ret3 >= ret3_max:
                     continue
             elif mode in ("momentum_hold3_v2", "momentum_hold3_v3"):
                 if ret3 >= 8:
@@ -988,6 +991,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--volume-ratio", type=float, default=1.5, help="param mode volume ratio")
     parser.add_argument("--pct-min", type=float, default=2.0, help="param mode pct min")
     parser.add_argument("--pct-max", type=float, default=6.0, help="param mode pct max")
+    parser.add_argument("--amount-min", type=float, default=300000000, help="param mode min amount in yuan")
+    parser.add_argument("--close-pos-min", type=float, default=0.7, help="param mode min close position")
+    parser.add_argument("--ret3-max", type=float, default=7.0, help="param mode max 3-day return")
     parser.add_argument(
         "--modes",
         nargs="+",
@@ -1144,6 +1150,9 @@ def main() -> None:
                     "pct_min": args.pct_min,
                     "pct_max": args.pct_max,
                     "volume_ratio": args.volume_ratio,
+                    "amount_min": args.amount_min,
+                    "close_pos_min": args.close_pos_min,
+                    "ret3_max": args.ret3_max,
                 },
             )
             if not picks:
