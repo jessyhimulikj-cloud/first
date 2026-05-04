@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from tushare_data_loader import load_history_tushare
+
+
+fallback_symbols = [
+    "000001", "000002", "000063", "000333", "000651",
+    "000725", "002129", "002230", "002241", "002475",
+    "002594", "002714", "300014", "300015", "300059",
+    "300122", "300274", "300750", "300760", "300782",
+    "600000", "600009", "600030", "600036", "600050",
+    "600276", "600309", "600519", "600887", "601012",
+    "000166", "000338", "000538", "000568", "000596",
+    "000625", "000661", "000708", "000723", "000768",
+    "000776", "000786", "000799", "000858", "000876",
+    "000895", "000938", "000963", "001979", "001289",
+    "002001", "002007", "002008", "002027", "002049",
+    "002050", "002074", "002142", "002179", "002202",
+    "002271", "002304", "002311", "002352", "002371",
+    "002410", "002415", "002460", "002466", "002493",
+    "002555", "002601", "002603", "002648", "002709",
+    "002812", "002821", "002841", "002916", "002920",
+    "002939", "003816", "300024", "300033", "300124",
+    "300136", "300142", "300308", "300316", "300408",
+    "300413", "300454", "300498", "300676", "300759",
+    "300896", "300919", "300957", "300999", "600010",
+    "600011", "600015", "600016", "600019", "600023",
+    "600025", "600031", "600048", "600104", "600111",
+    "600132", "600150", "600160", "600176", "600183",
+    "600196", "600233", "600346", "600406", "600438",
+    "600489", "600570", "600585", "600660", "600703",
+    "600745", "600760", "600809", "600845", "600893",
+    "600905", "600918", "600941", "601009", "601066",
+    "601088", "601100", "601111", "601138", "601166",
+    "601169", "601186", "601211", "601225", "601288",
+    "601318", "601328", "601336", "601390", "601398",
+    "601601", "601628", "601668", "601688", "601696",
+    "601728", "601766", "601800", "601816", "601818",
+    "601857", "601888", "601899", "601919", "601939",
+    "601985", "601988", "603019", "603259", "603288",
+    "603369", "603501", "603658", "603799", "603833",
+    "603899", "603986", "605117", "605499", "688008",
+    "688012", "688036", "688111", "688169", "688187",
+    "688223", "688256", "688271", "688303", "688363",
+    "688599", "688981",
+]
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--months", type=int, default=12)
+    p.add_argument("--universe-size", type=int, default=30)
+    p.add_argument("--data-dir", type=Path, default=Path("data"))
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    symbols = fallback_symbols[: args.universe_size] if args.universe_size > 0 else fallback_symbols
+
+    success_count = 0
+    fail_count = 0
+    skipped_count = 0
+    total = len(symbols)
+    for i, symbol in enumerate(symbols, start=1):
+        csv_path = args.data_dir / f"{symbol}.csv"
+        if csv_path.exists():
+            skipped_count += 1
+            print(f"[{i}/{total}] {symbol} 已存在，跳过")
+            print(f"  已跳过={skipped_count} 新下载成功={success_count} 失败={fail_count}")
+            continue
+        try:
+            df = load_history_tushare(symbol, months=args.months, data_dir=args.data_dir, max_retries=3, request_interval=0.4)
+            if df.empty:
+                fail_count += 1
+                print(f"[{i}/{total}] {symbol} 下载为空")
+            else:
+                success_count += 1
+                print(f"[{i}/{total}] {symbol} 下载成功")
+        except Exception as exc:
+            fail_count += 1
+            print(f"[{i}/{total}] {symbol} 下载失败: {exc}")
+        print(f"  已跳过={skipped_count} 新下载成功={success_count} 失败={fail_count}")
+
+    print(f"已存在跳过数量: {skipped_count}")
+    print(f"新下载成功数量: {success_count}")
+    print(f"失败数量: {fail_count}")
+    print(f"实际股票池数量: {len(symbols)}")
+    print(f"CSV保存路径: {args.data_dir.resolve()}")
