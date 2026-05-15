@@ -1,38 +1,25 @@
 #!/usr/bin/env python3
-"""自动选股系统（CSV + AkShare）
-
-- 保留 csv 模式
-- 新增 akshare 模式（短线 3-5 天模型）
-- 支持每天定时自动输出 TopN 到 picked_stocks.csv
-"""
-
+"""Tushare + DeepSeek 短线 AI 选股系统。"""
 from __future__ import annotations
 
 import argparse
 import csv
-import importlib
 import json
+import os
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
-from urllib.parse import urlencode
+from typing import Any, Dict, List
 
-REQUIRED_MARKET_COLUMNS = ["ts_code", "name", "close", "pct_chg", "vol_ratio", "turnover_rate"]
-REQUIRED_FLOW_COLUMNS = ["ts_code", "main_net_inflow", "super_net_inflow", "main_inflow_ratio"]
-REQUIRED_THEME_COLUMNS = ["theme", "heat_score"]
-REQUIRED_THEME_MAP_COLUMNS = ["ts_code", "theme"]
+from deepseek_client import analyze_candidate_pool
+from leader_analyzer import score_leaders
+from sentiment_analyzer import analyze_market_sentiment
+from strategy_config import ShortTermStrategyConfig
+from theme_analyzer import analyze_hot_themes, attach_theme_scores
+from trend_analyzer import add_trend_features
+from tushare_data_loader import load_daily_tushare, load_hs300_tushare, load_stock_basic_tushare, normalize_daily_df
 
-EASTMONEY_BASE = "https://push2.eastmoney.com/api/qt/clist/get"
-
-
-@dataclass
-class FactorWeights:
-    money_flow: float = 0.45
-    momentum: float = 0.25
-    liquidity: float = 0.15
-    hot_theme: float = 0.15
+DISCLAIMER = "免责声明：以上内容仅用于量化研究和交易辅助，不构成投资建议。"
 
 
 def _median(values: List[float]) -> float:
@@ -62,58 +49,38 @@ def robust_zscores(values: List[float]) -> List[float]:
     return [0.6745 * (v - med) / mad for v in values]
 
 
-def read_csv(path: Path, required_cols: List[str], name: str) -> List[Dict[str, str]]:
-    if not path.exists():
-        raise FileNotFoundError(f"找不到 {name} 文件: {path}")
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            raise ValueError(f"{name} 为空")
-        missing = [c for c in required_cols if c not in reader.fieldnames]
-        if missing:
-            raise ValueError(f"{name} 缺少字段: {missing}")
-        return list(reader)
-
-
-def _to_float(row: Dict[str, str], key: str) -> float:
-    return float(row.get(key, "0") or 0)
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _normalize_ts_code(code: str) -> str:
     code = str(code).strip()
-    if code.endswith(".SH") or code.endswith(".SZ"):
+    if code.endswith((".SH", ".SZ", ".BJ")):
         return code
-    return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
+    if code.startswith("6"):
+        return f"{code}.SH"
+    if code.startswith(("4", "8")):
+        return f"{code}.BJ"
+    return f"{code}.SZ"
 
 
-def _import_akshare() -> Any:
-    try:
-        return importlib.import_module("akshare")
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError("未安装 akshare。请执行: pip install akshare pandas") from exc
-
-
-def _df_to_rows(df: Any) -> List[Dict[str, Any]]:
-    if not hasattr(df, "to_dict"):
-        raise TypeError("数据源返回不是 DataFrame")
-    return df.to_dict(orient="records")
-
-
-def _pick(row: Dict[str, Any], keys: List[str], default: Any = 0) -> Any:
-    for k in keys:
-        if k in row and row[k] not in (None, ""):
-            return row[k]
-    return default
-
-
-def _is_excluded_stock(code: str, name: str, close: float, amount: float, pct_chg: float) -> Tuple[bool, str]:
-    name_u = name.upper()
-    if "ST" in name_u or "*ST" in name_u or "退" in name:
+def _is_excluded_stock(code: str, name: str, close: float, amount: float, pct_chg: float, config: ShortTermStrategyConfig | None = None) -> tuple[bool, str]:
+    config = config or ShortTermStrategyConfig()
+    name_u = str(name).upper()
+    code_s = str(code)
+    if "ST" in name_u or "退" in str(name):
         return True, "st_or_delist"
-    if str(code).startswith("8") or str(code).startswith("4"):
+    if code_s.startswith(("8", "4")) or code_s.endswith(".BJ"):
         return True, "beijing_exchange"
-    if close < 3:
+    if close < config.min_price:
         return True, "low_price"
+    if amount < config.min_amount:
+        return True, "low_amount"
     if pct_chg <= -9.5:
         return True, "limit_down"
     if pct_chg >= 9.5:
@@ -131,460 +98,334 @@ def _calc_momentum(close_list: List[float], days: int) -> float:
     return (latest / base - 1.0) * 100.0
 
 
-def _fetch_hot_board_symbols(ak: Any) -> set[str]:
-    """仅保留当前涨幅排名前20%的板块成分股。"""
-    hot_symbols: set[str] = set()
-    try:
-        board_rows = _df_to_rows(ak.stock_board_hot_rank_em())
-        if not board_rows:
-            return hot_symbols
+def _latest_per_symbol(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    latest: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        code = str(row.get("ts_code") or row.get("symbol") or "")
+        if not code:
+            continue
+        date = str(row.get("trade_date") or row.get("date") or "")
+        if code not in latest or date >= str(latest[code].get("trade_date") or latest[code].get("date") or ""):
+            latest[code] = row
+    return list(latest.values())
 
-        board_rows.sort(key=lambda x: float(_pick(x, ["涨跌幅", "今日涨跌幅", "change_percent"], 0) or 0), reverse=True)
-        top_n = max(1, int(len(board_rows) * 0.2))
 
-        for b in board_rows[:top_n]:
-            board_name = str(_pick(b, ["板块名称", "名称", "name"], "")).strip()
-            if not board_name:
-                continue
+def _load_tushare_market_history(args: argparse.Namespace, config: ShortTermStrategyConfig) -> List[Dict[str, Any]]:
+    """加载用于选股的多日行情；优先 data/*.csv 缓存，必要时请求 Tushare。"""
+    data_dir = Path(args.data_dir)
+    all_rows: List[Dict[str, Any]] = []
+    csv_files = sorted(p for p in data_dir.glob("*.csv") if len(p.stem) == 6 and p.stem.isdigit()) if data_dir.exists() else []
+    if csv_files:
+        for p in csv_files[: args.universe_size if args.universe_size > 0 else None]:
             try:
-                cons_rows = _df_to_rows(ak.stock_board_industry_cons_em(symbol=board_name))
-                for c in cons_rows:
-                    code = str(_pick(c, ["代码", "code"], "")).strip()
-                    if code:
-                        hot_symbols.add(code)
+                with p.open("r", encoding="utf-8", newline="") as f:
+                    file_rows = list(csv.DictReader(f))
             except Exception:
                 continue
-    except Exception:
-        return set()
-    return hot_symbols
+            for row in file_rows:
+                r = dict(row)
+                r["ts_code"] = _normalize_ts_code(p.stem)
+                r["symbol"] = p.stem
+                r.setdefault("name", p.stem)
+                r.setdefault("industry", "缓存股票")
+                if "trade_date" not in r or not r.get("trade_date"):
+                    r["trade_date"] = str(r.get("date", "")).replace("-", "")
+                all_rows.append(r)
+        return all_rows
 
+    if not os.getenv("TUSHARE_TOKEN", "").strip():
+        print("[WARN] 未配置 TUSHARE_TOKEN 且 data 目录无可用CSV，输出空结果。")
+        return []
 
-def _fetch_akshare_short_term(args: argparse.Namespace) -> List[Dict[str, float | str]]:
-    ak = _import_akshare()
-    spot_rows = _df_to_rows(ak.stock_zh_a_spot_em())
-    hot_symbols = _fetch_hot_board_symbols(ak)
-
-    candidates: List[Dict[str, Any]] = []
-    for r in spot_rows:
-        code = str(_pick(r, ["代码", "code"], "")).strip()
-        name = str(_pick(r, ["名称", "name"], "")).strip()
-        if not code or not name:
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=max(80, int(args.months * 31)))
+    start_date = start_dt.strftime("%Y%m%d")
+    end_date = end_dt.strftime("%Y%m%d")
+    basic = load_stock_basic_tushare(args.cache_dir)
+    basic_rows = basic.to_dict(orient="records") if hasattr(basic, "to_dict") else []
+    if args.universe_size > 0:
+        basic_rows = basic_rows[: args.universe_size]
+    for idx, info in enumerate(basic_rows, start=1):
+        ts_code = str(info.get("ts_code", ""))
+        if not ts_code:
             continue
+        try:
+            daily = load_daily_tushare(ts_code, start_date, end_date, args.cache_dir)
+            norm = normalize_daily_df(daily, basic)
+            all_rows.extend(norm.to_dict(orient="records"))
+        except Exception as exc:
+            print(f"[WARN] {ts_code} Tushare加载失败: {exc}")
+        if idx % 20 == 0:
+            print(f"  已加载历史数据 {idx}/{len(basic_rows)}")
+    return all_rows
 
-        close = float(_pick(r, ["最新价", "最新", "close"], 0) or 0)
-        pct_chg = float(_pick(r, ["涨跌幅", "pct_chg"], 0) or 0)
-        amount = float(_pick(r, ["成交额", "amount"], 0) or 0)
 
-        excluded, reason = _is_excluded_stock(code, name, close, amount, pct_chg)
+def _build_hs300_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    if not os.getenv("TUSHARE_TOKEN", "").strip():
+        return []
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=90)
+    try:
+        df = load_hs300_tushare(start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"), args.cache_dir)
+        if hasattr(df, "rename"):
+            df = df.rename(columns={"trade_date": "date"})
+            return df.to_dict(orient="records")
+    except Exception:
+        return []
+    return []
+
+
+def _score_liquidity(rows: List[Dict[str, Any]]) -> None:
+    amount_z = robust_zscores([_to_float(r.get("amount")) for r in rows])
+    turnover_z = robust_zscores([_to_float(r.get("turnover_rate")) for r in rows])
+    volume_z = robust_zscores([_to_float(r.get("volume_ratio")) for r in rows])
+    for i, r in enumerate(rows):
+        val = 0.5 + 0.2 * amount_z[i] + 0.15 * turnover_z[i] + 0.15 * volume_z[i]
+        r["liquidity_score"] = round(max(0.0, min(1.0, val)), 4)
+
+
+def _filter_candidates(rows: List[Dict[str, Any]], hot_names: set[str], config: ShortTermStrategyConfig) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        r = dict(row)
+        code = str(r.get("ts_code") or r.get("symbol") or "")
+        name = str(r.get("name") or code)
+        close = _to_float(r.get("close"))
+        amount = _to_float(r.get("amount"))
+        pct_chg = _to_float(r.get("pct_chg"))
+        excluded, reason = _is_excluded_stock(code, name, close, amount, pct_chg, config)
+        r["risk_flag"] = reason
         if excluded:
             continue
-        if hot_symbols and code not in hot_symbols:
+        if str(r.get("main_theme")) not in hot_names:
             continue
-
-        candidates.append(
-            {
-                "ts_code": _normalize_ts_code(code),
-                "code": code,
-                "name": name,
-                "close": close,
-                "pct_chg": pct_chg,
-                "amount": amount,
-                "risk_flag": reason,
-            }
-        )
-
-    # 先按成交额排序，限制后续历史请求数量，避免接口太慢
-    candidates.sort(key=lambda x: float(x["amount"]), reverse=True)
-    candidates = candidates[: args.ak_hist_limit]
-
-    picked: List[Dict[str, float | str]] = []
-    for c in candidates:
-        try:
-            hist_df = ak.stock_zh_a_hist(symbol=str(c["code"]), period="daily", adjust="qfq")
-            hist_rows = _df_to_rows(hist_df)
-            closes = [float(_pick(h, ["收盘", "close"], 0) or 0) for h in hist_rows if float(_pick(h, ["收盘", "close"], 0) or 0) > 0]
-            vols = [float(_pick(h, ["成交量", "volume"], 0) or 0) for h in hist_rows]
-            pct_list = [float(_pick(h, ["涨跌幅", "pct_chg"], 0) or 0) for h in hist_rows]
-            if len(closes) < 20 or len(vols) < 6 or len(pct_list) < 3:
-                continue
-
-            ma5 = sum(closes[-5:]) / 5.0
-            ma10 = sum(closes[-10:]) / 10.0
-            ma10_prev = sum(closes[-11:-1]) / 10.0
-            momentum_3 = _calc_momentum(closes, 3)
-            momentum_5 = _calc_momentum(closes, 5)
-            ret_10 = _calc_momentum(closes, 10)
-
-            # 趋势动量短线系统
-            if not (closes[-1] > ma5 > ma10):
-                continue
-            if not (ma10 > ma10_prev):
-                continue
-            if not (3 <= momentum_5 <= 15):
-                continue
-
-            avg_vol_5 = sum(vols[-5:]) / 5.0 if sum(vols[-5:]) > 0 else 0.0
-            if avg_vol_5 <= 0:
-                continue
-            volume_ratio = vols[-1] / avg_vol_5
-            if volume_ratio <= 1.3:
-                continue
-
-            row = {
-                "ts_code": c["ts_code"],
-                "name": c["name"],
-                "close": c["close"],
-                "pct_chg": c["pct_chg"],
-                "amount": c["amount"],
-                "momentum_3": momentum_3,
-                "momentum_5": momentum_5,
-                "ret_5": momentum_5,
-                "ret_10": ret_10,
-                "ma5": ma5,
-                "ma10": ma10,
-                "volume_ratio": volume_ratio,
-                "trend_flag": "trend_momentum_ok",
-                "risk_flag": "normal",
-            }
-            picked.append(row)
-        except Exception:
+        if not (_to_float(r.get("close")) > _to_float(r.get("ma5")) > _to_float(r.get("ma10")) > 0):
             continue
-
-    liquidity_z = robust_zscores([float(r["amount"]) for r in picked])
-    for idx, r in enumerate(picked):
-        r["liquidity_z"] = liquidity_z[idx]
-        r["total_score"] = (
-            0.30 * float(r["momentum_5"])
-            + 0.20 * float(r["momentum_3"])
-            + 0.30 * float(r["liquidity_z"])
-            + 0.20 * float(r["pct_chg"])
-        )
-
-    picked.sort(key=lambda x: float(x["total_score"]), reverse=True)
-    return picked
-
-
-def _build_session() -> Any:
-    """创建请求会话：禁用系统代理，统一浏览器头。"""
-    requests = importlib.import_module("requests")
-    session = requests.Session()
-    session.trust_env = False  # 禁用系统代理，解决代理污染问题
-    session.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://quote.eastmoney.com/",
-        }
-    )
-    return session
-
-
-def _http_get_json(url: str, timeout: int = 12, max_retries: int = 3) -> dict:
-    """
-    使用 requests.Session 拉取 JSON。
-    - 禁用系统代理
-    - 最多重试 3 次
-    - 返回 502 或请求失败自动重试
-    """
-    requests = importlib.import_module("requests")
-    session = _build_session()
-    last_exc: Exception | None = None
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = session.get(url, timeout=timeout)
-            if response.status_code == 502:
-                raise requests.HTTPError("502 Bad Gateway", response=response)
-            response.raise_for_status()
-            return response.json()
-        except (requests.RequestException, json.JSONDecodeError) as exc:
-            last_exc = exc
-            if attempt < max_retries:
-                time.sleep(0.8 * attempt)
-                continue
-            break
-
-    raise RuntimeError(f"HTTP 请求失败，重试{max_retries}次仍失败: {url}") from last_exc
-
-
-def _fetch_eastmoney_market(page_size: int = 200) -> List[Dict[str, str]]:
-    params = {
-        "pn": 1,
-        "pz": page_size,
-        "po": 1,
-        "np": 1,
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        "fltt": 2,
-        "invt": 2,
-        "fid": "f3",
-        "fs": "m:0+t:6,m:0+t:13,m:1+t:2,m:1+t:23",
-        "fields": "f12,f14,f2,f3,f8,f10",
-    }
-    data = _http_get_json(f"{EASTMONEY_BASE}?{urlencode(params)}")
-    diff = data.get("data", {}).get("diff", [])
-
-    rows: List[Dict[str, str]] = []
-    for item in diff:
-        code = str(item.get("f12", "")).strip()
-        if not code:
+        if not (config.momentum_5_min <= _to_float(r.get("momentum_5")) <= config.momentum_5_max):
             continue
-        rows.append(
-            {
-                "ts_code": _normalize_ts_code(code),
-                "name": str(item.get("f14", "")),
-                "close": str(item.get("f2", 0)),
-                "pct_chg": str(item.get("f3", 0)),
-                "turnover_rate": str(item.get("f8", 0)),
-                "vol_ratio": str(item.get("f10", 0)),
-            }
-        )
-    return rows
-
-
-def _fetch_eastmoney_flow(page_size: int = 200) -> List[Dict[str, str]]:
-    params = {
-        "pn": 1,
-        "pz": page_size,
-        "po": 1,
-        "np": 1,
-        "ut": "b2884a393a59ad64002292a3e90d46a5",
-        "fltt": 2,
-        "invt": 2,
-        "fid": "f62",
-        "fs": "m:0+t:6,m:0+t:13,m:1+t:2,m:1+t:23",
-        "fields": "f12,f62,f66,f184",
-    }
-    data = _http_get_json(f"{EASTMONEY_BASE}?{urlencode(params)}")
-    diff = data.get("data", {}).get("diff", [])
-
-    rows: List[Dict[str, str]] = []
-    for item in diff:
-        code = str(item.get("f12", "")).strip()
-        if not code:
+        if _to_float(r.get("volume_ratio")) < config.volume_ratio_min:
             continue
-        rows.append(
-            {
-                "ts_code": _normalize_ts_code(code),
-                "main_net_inflow": str(item.get("f62", 0)),
-                "super_net_inflow": str(item.get("f66", 0)),
-                "main_inflow_ratio": str(item.get("f184", 0)),
-            }
-        )
-    return rows
-
-
-def build_theme_score(theme_rows: List[Dict[str, str]], theme_map_rows: List[Dict[str, str]]) -> Dict[str, Dict[str, float]]:
-    if not theme_rows or not theme_map_rows:
-        return {}
-    theme_heat = {r["theme"]: _to_float(r, "heat_score") for r in theme_rows}
-    themes = list(theme_heat.keys())
-    zvals = robust_zscores([theme_heat[t] for t in themes])
-    theme_z = {t: z for t, z in zip(themes, zvals)}
-
-    stock_themes: Dict[str, List[str]] = {}
-    for row in theme_map_rows:
-        stock_themes.setdefault(row["ts_code"], []).append(row["theme"])
-
-    out: Dict[str, Dict[str, float]] = {}
-    for ts_code, tlist in stock_themes.items():
-        vals = [theme_z.get(t, 0.0) for t in tlist]
-        out[ts_code] = {
-            "hot_theme_score": sum(vals) / len(vals) if vals else 0.0,
-            "theme_count": float(len(set(tlist))),
-        }
+        if _to_float(r.get("close_position"), 0.0) < config.close_position_min:
+            continue
+        out.append(r)
     return out
 
 
-def score_stocks(
-    market_rows: List[Dict[str, str]],
-    flow_rows: List[Dict[str, str]],
-    theme_rows: List[Dict[str, str]],
-    theme_map_rows: List[Dict[str, str]],
-    weights: FactorWeights,
-) -> List[Dict[str, float | str]]:
-    market_by_code = {r["ts_code"]: r for r in market_rows}
-    flow_by_code = {r["ts_code"]: r for r in flow_rows}
-    theme_score = build_theme_score(theme_rows, theme_map_rows)
-
-    records: List[Dict[str, float | str]] = []
-    for ts_code in sorted(set(market_by_code).intersection(flow_by_code)):
-        m = market_by_code[ts_code]
-        f = flow_by_code[ts_code]
-
-        pct_chg = _to_float(m, "pct_chg")
-        vol_ratio = _to_float(m, "vol_ratio")
-        turnover_rate = _to_float(m, "turnover_rate")
-        main_net_inflow = _to_float(f, "main_net_inflow")
-        super_net_inflow = _to_float(f, "super_net_inflow")
-        main_inflow_ratio = _to_float(f, "main_inflow_ratio")
-
-        money_flow_raw = 0.55 * main_net_inflow + 0.25 * super_net_inflow + 0.20 * main_inflow_ratio
-        momentum_raw = 0.7 * pct_chg + 0.3 * vol_ratio
-        liquidity_raw = 0.6 * turnover_rate + 0.4 * vol_ratio
-
-        t = theme_score.get(ts_code, {"hot_theme_score": 0.0, "theme_count": 0.0})
-        records.append(
-            {
-                "ts_code": ts_code,
-                "name": m["name"],
-                "close": _to_float(m, "close"),
-                "pct_chg": pct_chg,
-                "main_net_inflow": main_net_inflow,
-                "main_inflow_ratio": main_inflow_ratio,
-                "theme_count": t["theme_count"],
-                "money_flow_raw": money_flow_raw,
-                "momentum_raw": momentum_raw,
-                "liquidity_raw": liquidity_raw,
-                "hot_theme_score": t["hot_theme_score"],
-                "turnover_rate": turnover_rate,
-                "risk_flag": "normal",
-            }
+def _fetch_tushare_short_term(args: argparse.Namespace) -> tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+    config = build_config(args)
+    rows = _load_tushare_market_history(args, config)
+    rows = add_trend_features(rows, config)
+    latest = _latest_per_symbol(rows)
+    hs300_rows = _build_hs300_rows(args) if config.use_market_filter else []
+    sentiment = analyze_market_sentiment(latest, hs300_rows)
+    themes, hot_names = analyze_hot_themes(latest, config.hot_theme_top_pct)
+    latest = attach_theme_scores(latest, themes)
+    candidates = _filter_candidates(latest, hot_names, config)
+    candidates = score_leaders(candidates)
+    _score_liquidity(candidates)
+    for r in candidates:
+        r["market_sentiment"] = sentiment["market_sentiment"]
+        r["risk_level"] = sentiment["risk_level"]
+        r["sentiment_cycle_score"] = sentiment["sentiment_cycle_score"]
+        r["total_score"] = round(
+            _to_float(r.get("hot_theme_score")) * 0.30
+            + _to_float(r.get("sentiment_cycle_score")) * 0.15
+            + _to_float(r.get("leader_score")) * 0.25
+            + _to_float(r.get("trend_strength_score")) * 0.20
+            + _to_float(r.get("liquidity_score")) * 0.10,
+            6,
         )
-
-    flow_z = robust_zscores([r["money_flow_raw"] for r in records])
-    momentum_z = robust_zscores([r["momentum_raw"] for r in records])
-    liq_z = robust_zscores([r["liquidity_raw"] for r in records])
-
-    for idx, r in enumerate(records):
-        r["total_score"] = (
-            weights.money_flow * flow_z[idx]
-            + weights.momentum * momentum_z[idx]
-            + weights.liquidity * liq_z[idx]
-            + weights.hot_theme * float(r["hot_theme_score"])
-        )
-
-    records.sort(key=lambda x: float(x["total_score"]), reverse=True)
-    return records
+    candidates.sort(key=lambda x: _to_float(x.get("total_score")), reverse=True)
+    return candidates, sentiment, themes
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="资金流+热点自动选股")
-    parser.add_argument("--source", choices=["csv", "eastmoney", "akshare"], default="csv")
-    parser.add_argument("--market", type=Path, help="csv模式行情文件")
-    parser.add_argument("--flow", type=Path, help="csv模式资金流文件")
-    parser.add_argument("--theme", type=Path, help="csv模式题材文件")
-    parser.add_argument("--theme-map", type=Path, help="csv模式题材映射")
-
-    parser.add_argument("--em-page-size", type=int, default=200)
-
-    parser.add_argument("--ak-hist-limit", type=int, default=150, help="akshare模式参与3/5日计算的股票上限")
-
-    parser.add_argument("--top", type=int, default=3)
-    parser.add_argument("--output", type=Path, default=Path("picked_stocks.csv"))
-
-    parser.add_argument("--auto-daily", action="store_true")
-    parser.add_argument("--daily-time", default="15:10")
-
-    parser.add_argument("--w-money-flow", type=float, default=0.45)
-    parser.add_argument("--w-momentum", type=float, default=0.25)
-    parser.add_argument("--w-liquidity", type=float, default=0.15)
-    parser.add_argument("--w-hot-theme", type=float, default=0.15)
-    return parser.parse_args()
-
-
-def build_weights(args: argparse.Namespace) -> FactorWeights:
-    weights = FactorWeights(args.w_money_flow, args.w_momentum, args.w_liquidity, args.w_hot_theme)
-    total = weights.money_flow + weights.momentum + weights.liquidity + weights.hot_theme
-    if abs(total - 1.0) > 1e-6:
-        raise ValueError(f"权重和必须为1，当前为 {total:.4f}")
-    return weights
-
-
-def _load_theme_optional(args: argparse.Namespace) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
-    if args.theme and args.theme_map:
-        return read_csv(args.theme, REQUIRED_THEME_COLUMNS, "theme"), read_csv(args.theme_map, REQUIRED_THEME_MAP_COLUMNS, "theme_map")
-    return [], []
-
-
-def _load_legacy_data(args: argparse.Namespace) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
-    if args.source == "csv":
-        if not args.market or not args.flow:
-            raise ValueError("source=csv 时必须提供 --market 和 --flow")
-        market = read_csv(args.market, REQUIRED_MARKET_COLUMNS, "market")
-        flow = read_csv(args.flow, REQUIRED_FLOW_COLUMNS, "flow")
-        theme, theme_map = _load_theme_optional(args)
-        return market, flow, theme, theme_map
-
-    market = _fetch_eastmoney_market(args.em_page_size)
-    flow = _fetch_eastmoney_flow(args.em_page_size)
-    theme, theme_map = _load_theme_optional(args)
-    return market, flow, theme, theme_map
-
-
-def write_output(rows: List[Dict[str, float | str]], path: Path, topn: int, source: str) -> None:
-    selected = rows[:topn]
-    if source == "akshare":
-        columns = [
-            "ts_code",
-            "name",
-            "close",
-            "pct_chg",
-            "amount",
-            "momentum_3",
-            "momentum_5",
-            "ret_5",
-            "ret_10",
-            "ma5",
-            "ma10",
-            "volume_ratio",
-            "trend_flag",
-            "total_score",
-            "risk_flag",
-        ]
-    else:
-        columns = ["ts_code", "name", "close", "pct_chg", "total_score", "risk_flag"]
-
+def _write_csv(rows: List[Dict[str, Any]], path: Path, columns: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True) if path.parent != Path("") else None
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
-        for r in selected:
+        for idx, row in enumerate(rows, start=1):
+            r = dict(row)
+            r.setdefault("rank", idx)
+            for k, v in list(r.items()):
+                if isinstance(v, (list, dict)):
+                    r[k] = json.dumps(v, ensure_ascii=False)
             writer.writerow({k: r.get(k, "") for k in columns})
 
-    print("=== Top Picks ===")
-    for r in selected:
-        print(f"{r.get('ts_code',''):>10} {str(r.get('name','')):<10} score={float(r.get('total_score',0)):.4f} risk={r.get('risk_flag','normal')}")
-    print(f"\n已输出到: {path}")
+
+def save_json(data: Dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True) if path.parent != Path("") else None
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def run_once(args: argparse.Namespace, weights: FactorWeights) -> None:
-    if args.source == "akshare":
-        rows = _fetch_akshare_short_term(args)
+def _flatten_ai_pick(pick: Dict[str, Any]) -> Dict[str, Any]:
+    plan = pick.get("operation_plan") or {}
+    return {
+        "ai_rating": pick.get("ai_rating", ""),
+        "ai_confidence": pick.get("confidence", ""),
+        "why_selected": pick.get("why_selected", ""),
+        "leader_judgement": pick.get("leader_judgement", ""),
+        "trend_judgement": pick.get("trend_judgement", ""),
+        "buy_condition": plan.get("buy_condition", ""),
+        "position_advice": plan.get("position", ""),
+        "stop_loss": plan.get("stop_loss", ""),
+        "take_profit": plan.get("take_profit", ""),
+        "max_holding_days": plan.get("max_holding_days", ""),
+        "risk_points": "；".join(str(x) for x in (pick.get("risk_points") or [])),
+    }
+
+
+def build_final_picks(candidates: List[Dict[str, Any]], sentiment: Dict[str, Any], themes: List[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
+    config = build_config(args)
+    pool = candidates[: args.ai_candidate_size]
+    if args.enable_ai_analysis:
+        analysis = analyze_candidate_pool(pool, sentiment, themes, final_top_n=args.ai_top_n, model=args.deepseek_model)
     else:
-        market, flow, theme, theme_map = _load_legacy_data(args)
-        rows = score_stocks(market, flow, theme, theme_map, weights)
-    write_output(rows, args.output, args.top, args.source)
+        from deepseek_client import build_fallback_analysis
+
+        analysis = build_fallback_analysis(pool, sentiment, args.top, "未启用 DeepSeek 分析，当前结果为量化模型Top3。")
+    by_code = {str(r.get("ts_code")): r for r in pool}
+    final: List[Dict[str, Any]] = []
+    for idx, pick in enumerate((analysis.get("picks") or [])[: config.final_top_n], start=1):
+        base = dict(by_code.get(str(pick.get("ts_code")), {}))
+        if not base and idx <= len(pool):
+            base = dict(pool[idx - 1])
+        base.update({"rank": idx})
+        base.update(_flatten_ai_pick(pick))
+        final.append(base)
+    while len(final) < config.final_top_n and len(final) < len(pool):
+        base = dict(pool[len(final)])
+        base.update({"rank": len(final) + 1})
+        final.append(base)
+    return final[: config.final_top_n]
+
+
+CANDIDATE_COLUMNS = [
+    "rank", "ts_code", "name", "industry", "main_theme", "theme_rank", "theme_strength", "market_sentiment", "risk_level",
+    "close", "pct_chg", "amount", "turnover_rate", "momentum_3", "momentum_5", "volume_ratio", "close_position", "ma5", "ma10", "ma20",
+    "hot_theme_score", "sentiment_cycle_score", "leader_score", "trend_strength_score", "liquidity_score", "total_score", "is_leader", "leader_rank", "leader_reason", "trend_reason", "risk_flag",
+]
+
+PICK_COLUMNS = [
+    "rank", "ts_code", "name", "main_theme", "market_sentiment", "risk_level", "close", "pct_chg", "amount", "momentum_3", "momentum_5", "volume_ratio", "ma5", "ma10", "ma20",
+    "hot_theme_score", "sentiment_cycle_score", "leader_score", "trend_strength_score", "liquidity_score", "total_score", "ai_rating", "ai_confidence", "why_selected", "leader_judgement", "trend_judgement", "buy_condition", "position_advice", "stop_loss", "take_profit", "max_holding_days", "risk_points",
+]
+
+HOT_THEME_COLUMNS = ["rank", "theme_name", "theme_strength", "hot_theme_score", "pct_chg_1d", "pct_chg_3d", "pct_chg_5d", "amount_ratio", "strong_stock_count", "limit_up_count"]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Tushare + DeepSeek 短线 AI 选股系统")
+    parser.add_argument("--source", choices=["tushare"], default="tushare")
+    parser.add_argument("--top", type=int, default=3)
+    parser.add_argument("--candidate-size", type=int, default=20)
+    parser.add_argument("--universe-size", type=int, default=80)
+    parser.add_argument("--months", type=int, default=3)
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--cache-dir", type=Path, default=Path(".cache_tushare"))
+    parser.add_argument("--output", type=Path, default=Path("picked_stocks.csv"))
+    parser.add_argument("--candidate-output", type=Path, default=Path("candidate_pool.csv"))
+    parser.add_argument("--market-sentiment-output", type=Path, default=Path("market_sentiment.json"))
+    parser.add_argument("--hot-themes-output", type=Path, default=Path("hot_themes.csv"))
+    parser.add_argument("--enable-ai-analysis", action="store_true")
+    parser.add_argument("--ai-top-n", type=int, default=3)
+    parser.add_argument("--ai-candidate-size", type=int, default=20)
+    parser.add_argument("--deepseek-model", default=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"))
+    parser.add_argument("--min-price", type=float, default=3.0)
+    parser.add_argument("--min-amount", type=float, default=100_000_000.0)
+    parser.add_argument("--momentum-5-min", type=float, default=3.0)
+    parser.add_argument("--momentum-5-max", type=float, default=18.0)
+    parser.add_argument("--volume-ratio-min", type=float, default=1.2)
+    parser.add_argument("--volume-ratio-max", type=float, default=2.5)
+    parser.add_argument("--close-position-min", type=float, default=0.6)
+    parser.add_argument("--no-market-filter", action="store_true")
+    parser.add_argument("--auto-daily", action="store_true")
+    parser.add_argument("--daily-time", default="15:10")
+    return parser.parse_args()
+
+
+def build_config(args: argparse.Namespace) -> ShortTermStrategyConfig:
+    return ShortTermStrategyConfig(
+        min_price=args.min_price,
+        min_amount=args.min_amount,
+        momentum_5_min=args.momentum_5_min,
+        momentum_5_max=args.momentum_5_max,
+        volume_ratio_min=args.volume_ratio_min,
+        volume_ratio_max=args.volume_ratio_max,
+        close_position_min=args.close_position_min,
+        candidate_size=args.candidate_size,
+        final_top_n=args.top,
+        use_market_filter=not args.no_market_filter,
+    )
+
+
+def print_report(final: List[Dict[str, Any]], sentiment: Dict[str, Any], themes: List[Dict[str, Any]], ai_enabled: bool) -> None:
+    print("=== 市场情绪 ===")
+    print(f"周期: {sentiment.get('market_sentiment', '')}")
+    print(f"风险等级: {sentiment.get('risk_level', '')}")
+    print(f"说明: {sentiment.get('sentiment_reason', '')}\n")
+    print("=== 今日主线热点 ===")
+    for t in themes[:3]:
+        print(f"{t.get('rank')}. {t.get('theme_name')} score={float(t.get('hot_theme_score', 0)):.4f}")
+    print("\n=== DeepSeek 精选三只短线标的 ===" if ai_enabled else "\n=== 量化模型Top3短线观察标的 ===")
+    for row in final:
+        print(f"\n#{row.get('rank')} {row.get('ts_code')} {row.get('name')}")
+        print(f"主线: {row.get('main_theme', '')}")
+        print(f"AI评级: {row.get('ai_rating', '')}")
+        print(f"入选原因: {row.get('why_selected', '')}")
+        print(f"龙头判断: {row.get('leader_judgement', '')}")
+        print(f"趋势判断: {row.get('trend_judgement', '')}")
+        print("操作建议:")
+        print(f"- 买入条件: {row.get('buy_condition', '')}")
+        print(f"- 仓位: {row.get('position_advice', '')}")
+        print(f"- 止损: {row.get('stop_loss', '')}")
+        print(f"- 止盈: {row.get('take_profit', '')}")
+        print(f"- 最长持有: {row.get('max_holding_days', '')}天")
+        print(f"风险: {row.get('risk_points', '')}")
+    if not ai_enabled:
+        print("\n未启用 DeepSeek 分析，当前结果为量化模型 Top3。")
+    print(f"\n{DISCLAIMER}")
+
+
+def run_once(args: argparse.Namespace) -> None:
+    candidates, sentiment, themes = _fetch_tushare_short_term(args)
+    candidate_pool = candidates[: args.candidate_size]
+    final = build_final_picks(candidates, sentiment, themes, args)
+    _write_csv(candidate_pool, args.candidate_output, CANDIDATE_COLUMNS)
+    _write_csv(final, args.output, PICK_COLUMNS)
+    save_json({"trade_date": datetime.now().strftime("%Y%m%d"), **sentiment}, args.market_sentiment_output)
+    _write_csv(themes, args.hot_themes_output, HOT_THEME_COLUMNS)
+    print_report(final, sentiment, themes, args.enable_ai_analysis)
+    print(f"\n已输出: {args.output}")
+    print(f"候选池: {args.candidate_output}")
+    print(f"市场情绪: {args.market_sentiment_output}")
+    print(f"热点主线: {args.hot_themes_output}")
 
 
 def _next_run_time(daily_time: str) -> datetime:
-    try:
-        hh, mm = daily_time.split(":")
-        target = datetime.now().replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
-    except Exception as exc:
-        raise ValueError("--daily-time 必须是 HH:MM，例如 15:10") from exc
+    hh, mm = daily_time.split(":")
+    target = datetime.now().replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
     if target <= datetime.now():
-        target = target + timedelta(days=1)
+        target += timedelta(days=1)
     return target
 
 
-def run_daily(args: argparse.Namespace, weights: FactorWeights) -> None:
+def run_daily(args: argparse.Namespace) -> None:
     print(f"已开启每日自动选股：{args.daily_time}，Top={args.top}")
     while True:
         nxt = _next_run_time(args.daily_time)
         wait_seconds = max(1, int((nxt - datetime.now()).total_seconds()))
-        print(f"下一次运行: {nxt.strftime('%Y-%m-%d %H:%M:%S')}，等待 {wait_seconds} 秒")
+        print(f"下一次运行时间：{nxt.strftime('%Y-%m-%d %H:%M:%S')}，等待 {wait_seconds} 秒")
         time.sleep(wait_seconds)
-        try:
-            run_once(args, weights)
-        except Exception as exc:
-            print(f"本次执行失败: {exc}")
+        run_once(args)
 
 
 def main() -> None:
     args = parse_args()
-    weights = build_weights(args)
     if args.auto_daily:
-        run_daily(args, weights)
+        run_daily(args)
     else:
-        run_once(args, weights)
+        run_once(args)
 
 
 if __name__ == "__main__":

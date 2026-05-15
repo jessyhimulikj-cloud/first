@@ -3,7 +3,7 @@
 
 功能：
 1. 每天 15:10 自动运行
-2. 调用 stock_picker.py（eastmoney 模式）
+2. 调用 stock_picker.py（tushare 模式）
 3. 输出 picked_stocks_YYYYMMDD.csv
 4. 累计写入 history.csv
 5. 当天已运行过则跳过
@@ -28,6 +28,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("."))
     parser.add_argument("--history", type=Path, default=Path("history.csv"))
     parser.add_argument("--once", action="store_true", help="立即执行一次并退出（调试用）")
+    parser.add_argument("--enable-ai-analysis", action="store_true", help="启用 DeepSeek 分析")
+    parser.add_argument("--ai-candidate-size", type=int, default=20, help="DeepSeek 候选池大小")
     return parser.parse_args()
 
 
@@ -58,17 +60,19 @@ def already_ran_today(history_file: Path, date_str: str, output_file: Path) -> b
     return False
 
 
-def run_picker(output_file: Path, top: int) -> None:
+def run_picker(output_file: Path, top: int, enable_ai_analysis: bool = False, ai_candidate_size: int = 20) -> None:
     cmd = [
         sys.executable,
         "stock_picker.py",
         "--source",
-        "eastmoney",
+        "tushare",
         "--top",
         str(top),
         "--output",
         str(output_file),
     ]
+    if enable_ai_analysis:
+        cmd.extend(["--enable-ai-analysis", "--ai-candidate-size", str(ai_candidate_size)])
     print("执行命令:", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
@@ -147,7 +151,7 @@ def execute_once(args: argparse.Namespace) -> None:
         return
 
     try:
-        run_picker(output_file, args.top)
+        run_picker(output_file, args.top, args.enable_ai_analysis, args.ai_candidate_size)
     except Exception as exc:
         print(f"选股执行失败: {exc}")
         return

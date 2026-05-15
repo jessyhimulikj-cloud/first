@@ -1,60 +1,49 @@
+import csv
+from pathlib import Path
+
 from stock_picker import (
     _calc_momentum,
-    _fetch_akshare_short_term,
+    _fetch_tushare_short_term,
     _is_excluded_stock,
     _normalize_ts_code,
     parse_args,
     robust_zscores,
+    run_once,
 )
 
 
-class FakeDF:
-    def __init__(self, rows):
-        self._rows = rows
-
-    def to_dict(self, orient="records"):
-        assert orient == "records"
-        return self._rows
-
-
-class FakeAk:
-    def stock_zh_a_spot_em(self):
-        return FakeDF(
-            [
-                {"代码": "600000", "名称": "浦发银行", "最新价": 10.0, "涨跌幅": 2.0, "成交额": 2e8},
-                {"代码": "000001", "名称": "平安银行", "最新价": 11.0, "涨跌幅": 1.5, "成交额": 3e8},
-                {"代码": "000002", "名称": "*ST测试", "最新价": 4.0, "涨跌幅": 1.0, "成交额": 2e8},
-            ]
-        )
-
-    def stock_zh_a_hist(self, symbol, period="daily", adjust="qfq"):
-        assert period == "daily"
-        assert adjust == "qfq"
-        if symbol == "600000":
-            closes = [12.0, 11.5, 11.0, 10.8, 10.6, 10.4, 10.2, 10.1, 10.0, 10.0, 10.1, 10.2, 10.3, 10.4, 10.45, 10.5, 10.58, 10.65, 10.72, 10.8]
-            vols = [200, 210, 220, 180, 170, 160, 150, 145, 140, 138, 136, 135, 140, 145, 150, 160, 170, 180, 190, 260]
-            pcts = [-1.5, -1.2, -1.0, -0.8, -0.5, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.2, 0.3, 0.4, 0.4, 0.5, 0.5, 0.5, 0.4, 0.5]
-        else:
-            closes = [11.8, 11.3, 10.9, 10.7, 10.5, 10.3, 10.1, 10.0, 9.95, 9.9, 9.95, 10.0, 10.05, 10.1, 10.2, 10.28, 10.35, 10.43, 10.5, 10.58]
-            vols = [190, 195, 200, 170, 160, 155, 150, 145, 140, 138, 136, 134, 138, 142, 146, 150, 158, 166, 174, 250]
-            pcts = [-1.2, -1.0, -0.8, -0.6, -0.4, -0.3, -0.2, -0.1, -0.1, -0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4, 0.4, 0.4, 0.4]
-        return FakeDF([{"收盘": c, "成交量": v, "涨跌幅": p} for c, v, p in zip(closes, vols, pcts)])
-
-    def stock_board_hot_rank_em(self):
-        return FakeDF(
-            [
-                {"板块名称": "人工智能", "涨跌幅": 3.5},
-                {"板块名称": "机器人", "涨跌幅": 2.0},
-                {"板块名称": "冷门板块", "涨跌幅": -1.0},
-                {"板块名称": "次热板块", "涨跌幅": 1.0},
-                {"板块名称": "普通板块", "涨跌幅": 0.5},
-            ]
-        )
-
-    def stock_board_industry_cons_em(self, symbol):
-        if symbol == "人工智能":
-            return FakeDF([{"代码": "600000"}, {"代码": "000001"}])
-        return FakeDF([])
+def _sample_history():
+    rows = []
+    specs = [
+        ("000001.SZ", "龙一", "人工智能", 10.0),
+        ("000002.SZ", "龙二", "人工智能", 11.0),
+        ("000063.SZ", "龙三", "人工智能", 12.0),
+        ("000333.SZ", "普通", "家电", 8.0),
+    ]
+    for code, name, industry, base in specs:
+        for i in range(25):
+            close = base + i * 0.08
+            if i == 24:
+                close += 0.45
+            rows.append(
+                {
+                    "trade_date": f"202605{i+1:02d}",
+                    "date": f"202605{i+1:02d}",
+                    "ts_code": code,
+                    "symbol": code[:6],
+                    "name": name,
+                    "industry": industry,
+                    "open": close - 0.1,
+                    "high": close + 0.1,
+                    "low": close - 0.3,
+                    "close": close,
+                    "pct_chg": 4.0 if industry == "人工智能" else 0.5,
+                    "volume": 1000 + i * 20 + (1200 if i == 24 else 0),
+                    "amount": 200_000_000 + i * 1_000_000,
+                    "turnover_rate": 5.0,
+                }
+            )
+    return rows
 
 
 def test_normalize_ts_code():
@@ -66,34 +55,74 @@ def test_is_excluded_stock():
     assert _is_excluded_stock("000001", "*ST测试", 10, 2e8, 1)[0] is True
     assert _is_excluded_stock("800001", "某股票", 10, 2e8, 1)[0] is True
     assert _is_excluded_stock("000001", "正常", 2.8, 2e8, 1)[0] is True
-    assert _is_excluded_stock("000001", "正常", 10, 9e7, 1)[0] is False
+    assert _is_excluded_stock("000001", "正常", 10, 9e7, 1)[0] is True
     assert _is_excluded_stock("000001", "正常", 10, 2e8, -6)[0] is False
     assert _is_excluded_stock("000001", "正常", 10, 2e8, 8)[0] is False
 
 
 def test_calc_momentum():
     closes = [10, 10.5, 11, 11.2, 11.5, 12]
-    m3 = _calc_momentum(closes, 3)
-    m5 = _calc_momentum(closes, 5)
-    assert m3 > 0
-    assert m5 > 0
+    assert _calc_momentum(closes, 3) > 0
+    assert _calc_momentum(closes, 5) > 0
 
 
-def test_fetch_akshare_short_term(monkeypatch):
-    monkeypatch.setattr("stock_picker._import_akshare", lambda: FakeAk())
-    args = type("Args", (), {"ak_hist_limit": 20})()
-    rows = _fetch_akshare_short_term(args)
-    assert len(rows) == 2
-    assert rows[0]["ts_code"].endswith((".SH", ".SZ"))
-    assert "total_score" in rows[0]
-    assert "momentum_3" in rows[0]
-    assert "momentum_5" in rows[0]
-    assert "ret_5" in rows[0]
-    assert "ret_10" in rows[0]
-    assert "ma5" in rows[0]
-    assert "ma10" in rows[0]
-    assert "volume_ratio" in rows[0]
-    assert rows[0]["trend_flag"] == "trend_momentum_ok"
+def test_fetch_tushare_short_term(monkeypatch):
+    args = type(
+        "Args",
+        (),
+        {
+            "min_price": 3.0,
+            "min_amount": 100_000_000,
+            "momentum_5_min": 3.0,
+            "momentum_5_max": 18.0,
+            "volume_ratio_min": 1.2,
+            "volume_ratio_max": 2.5,
+            "close_position_min": 0.6,
+            "candidate_size": 20,
+            "top": 3,
+            "no_market_filter": True,
+            "data_dir": Path("data"),
+            "universe_size": 10,
+            "months": 3,
+            "cache_dir": Path(".cache_tushare"),
+        },
+    )()
+    monkeypatch.setattr("stock_picker._load_tushare_market_history", lambda args, config: _sample_history())
+    rows, sentiment, themes = _fetch_tushare_short_term(args)
+    assert len(rows) >= 3
+    assert sentiment["market_sentiment"] in {"ice_point", "recovery", "main_rise", "climax", "decline"}
+    assert themes[0]["theme_name"] == "人工智能"
+    assert "leader_score" in rows[0]
+    assert "trend_strength_score" in rows[0]
+    assert "hot_theme_score" in rows[0]
+
+
+def test_run_once_outputs_three_without_ai(monkeypatch, tmp_path):
+    monkeypatch.setattr("stock_picker._load_tushare_market_history", lambda args, config: _sample_history())
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "stock_picker.py",
+            "--output",
+            str(tmp_path / "picked.csv"),
+            "--candidate-output",
+            str(tmp_path / "candidate.csv"),
+            "--market-sentiment-output",
+            str(tmp_path / "sentiment.json"),
+            "--hot-themes-output",
+            str(tmp_path / "themes.csv"),
+            "--no-market-filter",
+        ],
+    )
+    args = parse_args()
+    run_once(args)
+    with (tmp_path / "picked.csv").open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 3
+    assert "why_selected" in rows[0]
+    assert (tmp_path / "candidate.csv").exists()
+    assert (tmp_path / "sentiment.json").exists()
+    assert (tmp_path / "themes.csv").exists()
 
 
 def test_robust_zscores_non_empty():

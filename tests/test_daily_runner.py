@@ -29,3 +29,19 @@ def test_append_history_and_detect(tmp_path: Path):
 
     output = tmp_path / "picked_stocks_20260427.csv"
     assert already_ran_today(history, "20260427", output) is True
+
+
+def test_run_picker_uses_tushare_and_ai(monkeypatch, tmp_path: Path):
+    from daily_runner import run_picker
+
+    captured = {}
+
+    def fake_run(cmd, check):
+        captured["cmd"] = cmd
+        captured["check"] = check
+
+    monkeypatch.setattr("daily_runner.subprocess.run", fake_run)
+    run_picker(tmp_path / "picked.csv", 3, enable_ai_analysis=True, ai_candidate_size=12)
+    assert "tushare" in captured["cmd"]
+    assert "--enable-ai-analysis" in captured["cmd"]
+    assert "--ai-candidate-size" in captured["cmd"]

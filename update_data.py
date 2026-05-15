@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from tushare_data_loader import load_history_tushare
+from tushare_data_loader import load_history_tushare, load_hs300_tushare, load_stock_basic_tushare
 
 
 fallback_symbols = [
@@ -55,12 +55,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--months", type=int, default=12)
     p.add_argument("--universe-size", type=int, default=30)
     p.add_argument("--data-dir", type=Path, default=Path("data"))
+    p.add_argument("--cache-dir", type=Path, default=Path(".cache_tushare"))
+    p.add_argument("--skip-basic", action="store_true", help="跳过股票基础信息更新")
+    p.add_argument("--skip-index", action="store_true", help="跳过沪深300指数更新")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     symbols = fallback_symbols[: args.universe_size] if args.universe_size > 0 else fallback_symbols
+
+    if not args.skip_basic:
+        try:
+            basic_df = load_stock_basic_tushare(args.cache_dir, force=True)
+            print(f"股票基础信息更新成功: {len(basic_df)} 条")
+        except Exception as exc:
+            print(f"股票基础信息更新失败: {exc}")
 
     success_count = 0
     fail_count = 0
@@ -91,3 +101,14 @@ if __name__ == "__main__":
     print(f"失败数量: {fail_count}")
     print(f"实际股票池数量: {len(symbols)}")
     print(f"CSV保存路径: {args.data_dir.resolve()}")
+
+    if not args.skip_index:
+        from datetime import datetime, timedelta
+
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=31 * args.months)
+        try:
+            idx = load_hs300_tushare(start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"), args.cache_dir, force=True)
+            print(f"沪深300指数更新成功: {len(idx)} 条")
+        except Exception as exc:
+            print(f"沪深300指数更新失败: {exc}")

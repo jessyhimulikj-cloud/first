@@ -48,13 +48,6 @@ STRATEGY_CONFIG = {
 }
 
 
-def _import_akshare() -> Any:
-    try:
-        return importlib.import_module("akshare")
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError("未安装 akshare。请执行: pip install akshare pandas") from exc
-
-
 def _df_to_rows(df: Any) -> List[Dict[str, Any]]:
     if not hasattr(df, "to_dict"):
         raise TypeError("返回数据不是 DataFrame")
@@ -992,7 +985,7 @@ def parse_args() -> argparse.Namespace:
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["akshare", "eastmoney"], default="akshare", help="data source")
+    parser.add_argument("--source", choices=["tushare"], default="tushare", help="data source")
     parser.add_argument("--months", type=int, default=12, help="backtest months")
     parser.add_argument("--universe-size", type=int, default=30, help="stock universe size")
     parser.add_argument("--max-days", type=int, default=0, help="max trading days")
@@ -1024,9 +1017,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.source == "eastmoney":
-        print("[提示] 回测历史日线当前统一使用 akshare，已自动切换。")
-
     args.cache_dir.mkdir(parents=True, exist_ok=True)
 
     end_dt = datetime.now()
@@ -1103,12 +1093,18 @@ def main() -> None:
         hs300_allow = build_hs300_filter(hs300_rows)
         aligned_hs300_allow = align_regime_filter_to_trade_days(trading_days, hs300_allow)
 
-    # 名称映射（用实时快照，失败则用代码）
+    # 名称映射：Tushare 缓存 / stock_basic，失败则用代码。
     name_map: Dict[str, str] = {}
     try:
-        ak = _import_akshare()
-        spot_rows = _df_to_rows(ak.stock_zh_a_spot_em())
-        name_map = {str(r.get("代码", "")).strip(): str(r.get("名称", "")).strip() for r in spot_rows}
+        from tushare_data_loader import load_stock_basic_tushare
+
+        basic_df = load_stock_basic_tushare(args.cache_dir)
+        if hasattr(basic_df, "to_dict"):
+            for r in basic_df.to_dict(orient="records"):
+                code = str(r.get("symbol") or str(r.get("ts_code", "")).split(".")[0]).strip()
+                name = str(r.get("name", "")).strip()
+                if code and name:
+                    name_map[code] = name
     except Exception:
         pass
 

@@ -1,183 +1,244 @@
-# 自动选股系统（CSV + AkShare）
+# Tushare + DeepSeek 短线 AI 选股系统
 
-本项目提供一个可运行的自动选股脚本：
+本项目是一个用于量化研究和交易辅助学习的短线 A 股选股系统，主流程围绕：
 
-- 保留 `csv` 模式（兼容旧数据流程）
-- 新增 `akshare` 模式（真实 A 股行情 + 短线 3-5 天评分）
-- 输出 `picked_stocks.csv`
-- 支持每天自动筛选 Top3
+- **Tushare 数据**：股票基础信息、历史日线、每日指标、资金流、沪深300指数。
+- **主线热点**：识别行业/主题热度，优先选择市场主线前排。
+- **情绪周期**：判断市场处于冰点、修复、主升、高潮或退潮阶段。
+- **龙头股识别**：在主线内寻找成交额、涨幅、趋势和相对强度靠前的核心标的。
+- **趋势强化**：确认 `close > ma5 > ma10` / `close > ma5 > ma10 > ma20`、动量和放量质量。
+- **DeepSeek 二次分析**：从量化候选池中精选 3 只短线观察标的，并输出原因、操作计划和风险点。
+
+> 免责声明：本项目仅用于量化研究、程序开发和交易辅助学习，不构成任何投资建议。股票交易存在亏损风险，使用者应自行判断并承担全部风险。模型输出不代表未来收益，也不保证准确性。
 
 ---
 
-## 1. 环境（Windows + Python 3.12）
+## 1. 环境变量
 
-### Windows PowerShell
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install akshare pandas pytest
+```bash
+export TUSHARE_TOKEN="你的 Tushare Token"
+export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
+export DEEPSEEK_BASE_URL="https://api.deepseek.com"
+export DEEPSEEK_MODEL="deepseek-chat"
 ```
 
-### Linux/macOS
+说明：
+
+- `TUSHARE_TOKEN` 用于下载和更新行情数据。
+- `DEEPSEEK_API_KEY` 只有在使用 `--enable-ai-analysis` 时需要。
+- 未启用 DeepSeek 或未配置 API Key 时，系统仍会输出量化 Top3，AI 字段使用回退说明。
+
+---
+
+## 2. 安装依赖
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install akshare pandas pytest
+pip install pandas tushare requests pytest
+```
+
+Windows PowerShell：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install pandas tushare requests pytest
 ```
 
 ---
 
-## 2. 运行命令
+## 3. 更新数据
 
-## 2.1 CSV 模式（保留）
+```bash
+python update_data.py \
+  --months 12 \
+  --universe-size 300 \
+  --data-dir data
+```
+
+更新脚本会尽量更新：
+
+- 股票基础信息缓存
+- 股票历史日线 CSV
+- 沪深300指数缓存
+
+如只想使用已有缓存调试，可跳过基础信息或指数：
+
+```bash
+python update_data.py --skip-basic --skip-index
+```
+
+---
+
+## 4. 单次量化选股
 
 ```bash
 python stock_picker.py \
-  --source csv \
-  --market sample_data/market.csv \
-  --flow sample_data/flow.csv \
-  --theme sample_data/theme.csv \
-  --theme-map sample_data/theme_map.csv \
+  --source tushare \
   --top 3 \
   --output picked_stocks.csv
 ```
 
-## 2.2 AkShare 模式（新）
+默认输出：
+
+- `picked_stocks.csv`：最终 3 只短线观察标的
+- `candidate_pool.csv`：量化候选池，默认前 20 只
+- `market_sentiment.json`：市场情绪周期
+- `hot_themes.csv`：主线热点排名
+
+---
+
+## 5. 启用 DeepSeek 分析
 
 ```bash
 python stock_picker.py \
-  --source akshare \
-  --ak-hist-limit 150 \
+  --source tushare \
   --top 3 \
+  --enable-ai-analysis \
+  --ai-candidate-size 20 \
   --output picked_stocks.csv
 ```
 
-## 2.3 每天自动筛选 Top3
+DeepSeek 的职责不是从全市场直接选股，而是基于量化候选池做二次判断，最终输出 3 只标的，并给出：
+
+- 入选原因
+- 龙头判断
+- 趋势判断
+- 买入观察条件
+- 仓位建议
+- 止损和止盈规则
+- 最长持有天数
+- 风险点
+
+---
+
+## 6. 短线策略逻辑
+
+总分模型：
+
+```python
+total_score = (
+    hot_theme_score * 0.30
+    + sentiment_cycle_score * 0.15
+    + leader_score * 0.25
+    + trend_strength_score * 0.20
+    + liquidity_score * 0.10
+)
+```
+
+### 主线热点
+
+热点分数由行业/主题 1 日、3 日、5 日表现、成交额占比、强势股数量等构成。系统优先选择主线排名前 20% 的股票。
+
+### 情绪周期
+
+系统把市场分为：
+
+- `ice_point`：冰点
+- `recovery`：修复
+- `main_rise`：主升
+- `climax`：高潮
+- `decline`：退潮
+
+情绪越弱，操作建议越保守。
+
+### 龙头识别
+
+龙头分数综合：
+
+- 所属主线热度
+- 主线内涨幅排名
+- 成交额排名
+- 放量强度
+- 趋势强度
+- 近 3 日相对板块强度
+
+### 趋势强化
+
+优先满足：
+
+```text
+close > ma5 > ma10 > ma20
+```
+
+至少满足：
+
+```text
+close > ma5 > ma10
+```
+
+并结合 3 日/5 日动量、量比、收盘位置过滤趋势衰竭标的。
+
+---
+
+## 7. 每日运行
+
+立即执行一次：
 
 ```bash
-python stock_picker.py \
-  --source akshare \
+python daily_runner.py \
+  --once \
   --top 3 \
-  --auto-daily \
-  --daily-time 15:10 \
-  --output picked_stocks.csv
+  --enable-ai-analysis
+```
+
+常驻每日运行：
+
+```bash
+python daily_runner.py \
+  --time 15:10 \
+  --top 3 \
+  --enable-ai-analysis \
+  --output-dir . \
+  --history history.csv
 ```
 
 ---
 
-## 3. AkShare 模式策略逻辑（简化可运行版）
-
-### 数据来源
-- A 股实时行情列表：`stock_zh_a_spot_em`
-- 个股历史日线（用于 3/5 日涨幅）：`stock_zh_a_hist`
-
-### 风险过滤
-- 剔除 ST / 退市
-- 剔除北交所（代码 8/4 开头）
-- 剔除价格 < 3 元
-- 剔除成交额 < 1 亿
-- 剔除跌幅 < -5%
-- 剔除涨幅 > 9.5%
-
-### 指标与评分
-- `momentum_5`：5 日涨幅
-- `momentum_3`：3 日涨幅
-- `liquidity_z`：成交额的 z 分数
-- `pct_chg`：今日涨跌幅
-
-新增短线增强规则：
-- 趋势确认（必须满足）：`close > ma5 > ma10`
-- ma10 上升（今日 ma10 > 昨日 ma10）
-- 5日涨幅在 `3%~15%`
-- 放量确认：`今日成交量 > 5日均量 * 1.3`
-- 风控：剔除涨停/跌停/ST/低价
-- 热点强化：仅保留当前涨幅排名前 20% 板块成分股
-
-`total_score = momentum_5 * 0.30 + momentum_3 * 0.20 + liquidity_z * 0.30 + pct_chg * 0.20`
-
-### 输出字段
-- `ts_code, name, close, pct_chg, amount, momentum_3, momentum_5, ret_5, ret_10, ma5, ma10, volume_ratio, trend_flag, total_score, risk_flag`
-
----
-
-## 4. 测试
+## 8. 回测
 
 ```bash
-pytest -q
+python backtest.py \
+  --source tushare \
+  --months 6 \
+  --universe-size 100 \
+  --output backtest_result.csv
 ```
 
----
-
-## 5. 回测（新增 backtest.py）
-
-`backtest.py` 用于验证短线策略，默认回测最近 3 个月，并输出 `backtest_result.csv`。
-
-### 运行命令
-
-```bash
-python backtest.py --months 3 --universe-size 50 --max-days 60 --output backtest_result.csv
-```
-
-更激进样例：
-```bash
-python backtest.py --months 6 --universe-size 100 --max-days 120 --output backtest_result.csv
-```
-
-### 回测规则（实现）
-
-- 每个交易日收盘：按 `stock_picker` 短线逻辑打分，选 Top3 中分数最高 1 只
-- 次日开盘涨幅 `<2%` 才允许买入，买入价使用 `next_day_open`
-- 次日开盘涨幅需在 `-1% ~ +2%`，高开>2%不买、低开>1%不买
-- 大盘过滤：若沪深300收盘 < 20日均线，当天不交易
-- 三种卖出策略：
-  - 核心：止损 -2%
-  - 分段止盈：+4% 先卖 50%
-  - 剩余仓位：跌破 MA5 卖出，或最多持有 5 天
-  - 移动止盈：盈利超过 3% 后，若从高点回撤超过 2% 则卖出
-- 回测仓位：单次 100% 仓位
-- 交易成本：默认手续费 0.3% + 双边滑点（单边 0.1%），可通过参数调整
-
-### 输出指标
+回测保留原有指标：
 
 - 总交易次数
 - 胜率
 - 平均收益
 - 最大回撤
 - 盈亏比
-- 每年收益
-
-### 性能与稳定性
-
-- 带进度打印（加载数据、回测进度）
-- 带异常处理（单标的失败自动跳过）
-- 带数据缓存（默认 `.cache_backtest/`，避免重复请求）
+- 年度收益
 
 ---
 
-## 6. 每日自动选股（新增 daily_runner.py）
+## 9. 主要文件
 
-功能：
-- 每天 `15:10` 自动执行
-- 调用 `stock_picker.py --source eastmoney`
-- 输出 `picked_stocks_日期.csv`
-- 累计写入 `history.csv`
-- 当天已执行过则自动跳过
-
-### 启动命令（常驻）
-
-```bash
-python daily_runner.py --time 15:10 --top 3 --output-dir . --history history.csv
+```text
+tushare_data_loader.py       # Tushare 数据获取和缓存
+strategy_config.py           # 策略参数配置
+theme_analyzer.py            # 主线热点分析
+sentiment_analyzer.py        # 市场情绪周期分析
+leader_analyzer.py           # 龙头股识别
+trend_analyzer.py            # 趋势强化分析
+deepseek_client.py           # DeepSeek API 客户端
+stock_picker.py              # 主选股入口
+daily_runner.py              # 每日运行入口
+backtest.py                  # 回测
+update_data.py               # 批量更新数据
 ```
 
-### 立即执行一次（调试）
+---
+
+## 10. 测试
 
 ```bash
-python daily_runner.py --once --top 3 --output-dir . --history history.csv
+pytest -q
 ```
 
-执行后会打印：
-- 今日推荐股票
-- 分数
-- 买入建议（开盘价附近分批买入）
+测试会 mock 外部接口，不应真实请求 Tushare 或 DeepSeek。
