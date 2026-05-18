@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import math
 import sys
 import textwrap
 from dataclasses import dataclass
@@ -158,53 +159,276 @@ def get_daily_basic(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
     return df.sort_values("trade_date").reset_index(drop=True)
 
 
-def get_financial_data(pro: ts.pro_api, ts_code: str) -> dict[str, pd.Series | None]:
-    financials: dict[str, pd.Series | None] = {"income": None, "indicator": None, "balancesheet": None}
+FINANCIAL_LOOKBACK_YEARS = 5
+MIN_FINANCIAL_PERIODS = 8
 
-    print_step("获取财务数据：营收、净利润")
-    try:
-        income = pro.income(
-            ts_code=ts_code,
-            fields="ts_code,end_date,ann_date,report_type,total_revenue,n_income_attr_p",
-        )
-        if income is not None and not income.empty:
-            financials["income"] = income.sort_values("end_date", ascending=False).iloc[0]
-            print_success("营收、净利润获取成功")
-        else:
-            print_warning("营收、净利润数据为空")
-    except Exception as exc:
-        print_warning(f"营收、净利润获取失败：{exc}")
 
-    print_step("获取财务数据：ROE、毛利率")
+def get_financial_start_date() -> str:
+    """Return the earliest report date used for the rolling financial window."""
+    today = dt.datetime.now()
     try:
-        indicator = pro.fina_indicator(
-            ts_code=ts_code,
-            fields="ts_code,end_date,ann_date,roe,grossprofit_margin",
-        )
-        if indicator is not None and not indicator.empty:
-            financials["indicator"] = indicator.sort_values("end_date", ascending=False).iloc[0]
-            print_success("ROE、毛利率获取成功")
-        else:
-            print_warning("ROE、毛利率数据为空")
-    except Exception as exc:
-        print_warning(f"ROE、毛利率获取失败：{exc}")
+        start = today.replace(year=today.year - FINANCIAL_LOOKBACK_YEARS)
+    except ValueError:  # Handles leap day.
+        start = today.replace(year=today.year - FINANCIAL_LOOKBACK_YEARS, day=28)
+    return start.strftime("%Y%m%d")
 
-    print_step("获取财务数据：资产负债率")
+
+def normalize_financial_frame(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Keep the latest disclosed row for each report period and sort newest first."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    normalized = df.copy()
+    if "end_date" not in normalized.columns:
+        return normalized.reset_index(drop=True)
+
+    normalized["end_date"] = normalized["end_date"].astype(str)
+    sort_columns = ["end_date"]
+    ascending = [False]
+    if "ann_date" in normalized.columns:
+        normalized["ann_date"] = normalized["ann_date"].astype(str)
+        sort_columns.append("ann_date")
+        ascending.append(False)
+
+    normalized = normalized.sort_values(sort_columns, ascending=ascending)
+    normalized = normalized.drop_duplicates(subset=["end_date"], keep="first")
+    recent_periods = normalized["end_date"].head(MIN_FINANCIAL_PERIODS)
+    start_date = get_financial_start_date()
+    keep_mask = (normalized["end_date"] >= start_date) | normalized["end_date"].isin(recent_periods)
+    return normalized.loc[keep_mask].reset_index(drop=True)
+
+
+def fetch_financial_frame(func: Any, ts_code: str, fields: str, start_date: str) -> pd.DataFrame:
+    """Fetch a rolling financial frame and retry without date filter if fewer than 8 periods return."""
+    df = normalize_financial_frame(func(ts_code=ts_code, start_date=start_date, fields=fields))
+    if len(df) >= MIN_FINANCIAL_PERIODS:
+        return df
+
     try:
-        balance = pro.balancesheet(
-            ts_code=ts_code,
-            fields="ts_code,end_date,ann_date,total_assets,total_liab",
+        expanded = normalize_financial_frame(func(ts_code=ts_code, fields=fields))
+    except Exception:
+        return df
+    if len(expanded) > len(df):
+        return expanded
+    return df
+
+
+def get_financial_data(pro: ts.pro_api, ts_code: str) -> dict[str, pd.DataFrame]:
+    financials: dict[str, pd.DataFrame] = {
+        "income": pd.DataFrame(),
+        "indicator": pd.DataFrame(),
+        "balancesheet": pd.DataFrame(),
+        "cashflow": pd.DataFrame(),
+    }
+    start_date = get_financial_start_date()
+    window_note = f"最近 {FINANCIAL_LOOKBACK_YEARS} 年，且至少保留最近 {MIN_FINANCIAL_PERIODS} 个报告期"
+
+    print_step(f"获取财务数据：利润表（{window_note}）")
+    try:
+        income = fetch_financial_frame(
+            pro.income,
+            ts_code,
+            "ts_code,end_date,ann_date,report_type,total_revenue,n_income_attr_p",
+            start_date,
         )
-        if balance is not None and not balance.empty:
-            financials["balancesheet"] = balance.sort_values("end_date", ascending=False).iloc[0]
-            print_success("资产负债率获取成功")
+        if not income.empty:
+            financials["income"] = income
+            print_success(f"利润表获取成功，保留 {len(income)} 个报告期")
         else:
-            print_warning("资产负债率数据为空")
+            print_warning("利润表数据为空")
     except Exception as exc:
-        print_warning(f"资产负债率获取失败：{exc}")
+        print_warning(f"利润表获取失败：{exc}")
+
+    print_step(f"获取财务数据：财务指标（{window_note}）")
+    try:
+        indicator = fetch_financial_frame(
+            pro.fina_indicator,
+            ts_code,
+            "ts_code,end_date,ann_date,roe,grossprofit_margin,netprofit_margin,profit_dedt",
+            start_date,
+        )
+        if not indicator.empty:
+            financials["indicator"] = indicator
+            print_success(f"财务指标获取成功，保留 {len(indicator)} 个报告期")
+        else:
+            print_warning("财务指标数据为空")
+    except Exception as exc:
+        print_warning(f"财务指标获取失败：{exc}")
+
+    print_step(f"获取财务数据：资产负债表（{window_note}）")
+    try:
+        balance = fetch_financial_frame(
+            pro.balancesheet,
+            ts_code,
+            "ts_code,end_date,ann_date,total_assets,total_liab",
+            start_date,
+        )
+        if not balance.empty:
+            financials["balancesheet"] = balance
+            print_success(f"资产负债表获取成功，保留 {len(balance)} 个报告期")
+        else:
+            print_warning("资产负债表数据为空")
+    except Exception as exc:
+        print_warning(f"资产负债表获取失败：{exc}")
+
+    print_step(f"获取财务数据：现金流量表（{window_note}）")
+    try:
+        cashflow = fetch_financial_frame(
+            pro.cashflow,
+            ts_code,
+            "ts_code,end_date,ann_date,n_cashflow_act",
+            start_date,
+        )
+        if not cashflow.empty:
+            financials["cashflow"] = cashflow
+            print_success(f"现金流量表获取成功，保留 {len(cashflow)} 个报告期")
+        else:
+            print_warning("现金流量表数据为空")
+    except Exception as exc:
+        print_warning(f"现金流量表获取失败：{exc}")
 
     return financials
 
+
+def to_numeric(value: Any) -> float | None:
+    """Convert scalar financial values to float, returning None for missing values."""
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def pct_change_text(current: Any, previous: Any) -> str:
+    current_value = to_numeric(current)
+    previous_value = to_numeric(previous)
+    if current_value is None or previous_value in (None, 0):
+        return "暂无可比数据"
+    return f"{(current_value / previous_value - 1) * 100:.2f}%"
+
+
+def trend_direction(values: list[float]) -> str:
+    if len(values) < 2:
+        return "数据不足"
+    first = values[-1]
+    last = values[0]
+    if pd.isna(first) or pd.isna(last):
+        return "数据不足"
+    if last > first:
+        return "上升"
+    if last < first:
+        return "下降"
+    return "基本持平"
+
+
+def get_period_row(df: pd.DataFrame, end_date: str) -> pd.Series | None:
+    if df.empty or "end_date" not in df.columns:
+        return None
+    matched = df[df["end_date"].astype(str) == str(end_date)]
+    if matched.empty:
+        return None
+    return matched.iloc[0]
+
+
+def safe_ratio(numerator: Any, denominator: Any) -> float | None:
+    numerator_value = to_numeric(numerator)
+    denominator_value = to_numeric(denominator)
+    if numerator_value is None or denominator_value in (None, 0):
+        return None
+    return numerator_value / denominator_value
+
+
+def calculate_financial_trends(financials: dict[str, pd.DataFrame]) -> dict[str, Any]:
+    """Calculate multi-period financial trends and recent anomaly combinations."""
+    print_step("计算财务趋势：同比、利润率、现金流、资产负债率与异常组合")
+    income = financials.get("income", pd.DataFrame())
+    indicator = financials.get("indicator", pd.DataFrame())
+    balance = financials.get("balancesheet", pd.DataFrame())
+    cashflow = financials.get("cashflow", pd.DataFrame())
+
+    periods = sorted(
+        {str(value) for df in (income, indicator, balance, cashflow) if not df.empty for value in df.get("end_date", [])},
+        reverse=True,
+    )
+    trend_rows: list[dict[str, Any]] = []
+    for end_date in periods:
+        income_row = get_period_row(income, end_date)
+        indicator_row = get_period_row(indicator, end_date)
+        balance_row = get_period_row(balance, end_date)
+        cashflow_row = get_period_row(cashflow, end_date)
+        previous_year = f"{int(end_date[:4]) - 1}{end_date[4:]}" if len(end_date) == 8 and end_date[:4].isdigit() else ""
+        previous_income = get_period_row(income, previous_year) if previous_year else None
+        previous_indicator = get_period_row(indicator, previous_year) if previous_year else None
+        previous_cashflow = get_period_row(cashflow, previous_year) if previous_year else None
+
+        operating_cashflow = cashflow_row.get("n_cashflow_act") if cashflow_row is not None else None
+        net_profit = income_row.get("n_income_attr_p") if income_row is not None else None
+        total_assets = balance_row.get("total_assets") if balance_row is not None else None
+        total_liab = balance_row.get("total_liab") if balance_row is not None else None
+        trend_rows.append(
+            {
+                "end_date": end_date,
+                "revenue": income_row.get("total_revenue") if income_row is not None else None,
+                "revenue_yoy": pct_change_text(
+                    income_row.get("total_revenue") if income_row is not None else None,
+                    previous_income.get("total_revenue") if previous_income is not None else None,
+                ),
+                "net_profit": net_profit,
+                "net_profit_yoy": pct_change_text(
+                    net_profit,
+                    previous_income.get("n_income_attr_p") if previous_income is not None else None,
+                ),
+                "deducted_net_profit": indicator_row.get("profit_dedt") if indicator_row is not None else None,
+                "deducted_net_profit_yoy": pct_change_text(
+                    indicator_row.get("profit_dedt") if indicator_row is not None else None,
+                    previous_indicator.get("profit_dedt") if previous_indicator is not None else None,
+                ),
+                "roe": indicator_row.get("roe") if indicator_row is not None else None,
+                "gross_margin": indicator_row.get("grossprofit_margin") if indicator_row is not None else None,
+                "net_margin": indicator_row.get("netprofit_margin") if indicator_row is not None else None,
+                "operating_cashflow": operating_cashflow,
+                "operating_cashflow_to_net_profit": safe_ratio(operating_cashflow, net_profit),
+                "operating_cashflow_yoy": pct_change_text(
+                    operating_cashflow,
+                    previous_cashflow.get("n_cashflow_act") if previous_cashflow is not None else None,
+                ),
+                "debt_ratio": safe_ratio(total_liab, total_assets) * 100 if safe_ratio(total_liab, total_assets) is not None else None,
+            }
+        )
+
+    latest = trend_rows[0] if trend_rows else {}
+    anomalies: list[str] = []
+    latest_revenue_yoy = latest.get("revenue_yoy")
+    latest_profit_yoy = latest.get("net_profit_yoy")
+    latest_cashflow_yoy = latest.get("operating_cashflow_yoy")
+    revenue_yoy_value = to_numeric(str(latest_revenue_yoy).replace("%", "")) if latest_revenue_yoy != "暂无可比数据" else None
+    profit_yoy_value = to_numeric(str(latest_profit_yoy).replace("%", "")) if latest_profit_yoy != "暂无可比数据" else None
+    cashflow_yoy_value = to_numeric(str(latest_cashflow_yoy).replace("%", "")) if latest_cashflow_yoy != "暂无可比数据" else None
+    cashflow_profit_ratio = latest.get("operating_cashflow_to_net_profit")
+
+    if revenue_yoy_value is not None and profit_yoy_value is not None and revenue_yoy_value > 0 and profit_yoy_value < 0:
+        anomalies.append("最近一期收入同比增长但归母净利润同比下滑，需关注增收不增利风险。")
+    if profit_yoy_value is not None and cashflow_yoy_value is not None and profit_yoy_value > 0 and cashflow_yoy_value < 0:
+        anomalies.append("最近一期归母净利润同比增长但经营现金流同比恶化，需关注利润质量。")
+    if profit_yoy_value is not None and profit_yoy_value > 0 and cashflow_profit_ratio is not None and cashflow_profit_ratio < 0.8:
+        anomalies.append("最近一期经营现金流/净利润低于 0.8，利润现金含量偏弱。")
+    if not anomalies:
+        anomalies.append("最近一期未发现收入、利润与现金流之间的典型背离组合，仍需结合行业周期和会计政策复核。")
+
+    roe_values = [value for value in (to_numeric(row.get("roe")) for row in trend_rows) if value is not None]
+    gross_margin_values = [value for value in (to_numeric(row.get("gross_margin")) for row in trend_rows) if value is not None]
+    net_margin_values = [value for value in (to_numeric(row.get("net_margin")) for row in trend_rows) if value is not None]
+    debt_ratio_values = [value for value in (to_numeric(row.get("debt_ratio")) for row in trend_rows) if value is not None]
+    conclusions = [
+        f"ROE 多期趋势：{trend_direction(roe_values)}。",
+        f"毛利率多期趋势：{trend_direction(gross_margin_values)}。",
+        f"净利率多期趋势：{trend_direction(net_margin_values)}。",
+        f"资产负债率趋势：{trend_direction(debt_ratio_values)}。",
+        *anomalies,
+    ]
+    print_success("财务趋势计算完成")
+    return {"rows": trend_rows, "conclusions": conclusions}
 
 def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
@@ -236,27 +460,95 @@ def safe_fmt(value: Any, suffix: str = "", digits: int = 2) -> str:
     if value is None or pd.isna(value):
         return "暂无数据"
     if isinstance(value, (int, float)):
-        return f"{value:.{digits}f}{suffix}"
+        numeric_value = float(value)
+        if math.isnan(numeric_value) or math.isinf(numeric_value):
+            return "暂无数据"
+        return f"{numeric_value:.{digits}f}{suffix}"
     return str(value)
 
+
+
+def format_financial_trend_rows(rows: list[dict[str, Any]], limit: int = 20) -> str:
+    if not rows:
+        return "暂无多期财务数据"
+
+    headers = [
+        "报告期",
+        "营收",
+        "营收同比",
+        "归母净利润",
+        "归母净利润同比",
+        "扣非净利润",
+        "扣非净利润同比",
+        "ROE",
+        "毛利率",
+        "净利率",
+        "经营现金流",
+        "经营现金流/净利润",
+        "经营现金流同比",
+        "资产负债率",
+    ]
+    lines = [" | ".join(headers), " | ".join(["---"] * len(headers))]
+    for row in rows[:limit]:
+        lines.append(
+            " | ".join(
+                [
+                    str(row.get("end_date", "暂无数据")),
+                    safe_fmt(row.get("revenue"), " 元"),
+                    str(row.get("revenue_yoy", "暂无可比数据")),
+                    safe_fmt(row.get("net_profit"), " 元"),
+                    str(row.get("net_profit_yoy", "暂无可比数据")),
+                    safe_fmt(row.get("deducted_net_profit"), " 元"),
+                    str(row.get("deducted_net_profit_yoy", "暂无可比数据")),
+                    safe_fmt(row.get("roe"), "%"),
+                    safe_fmt(row.get("gross_margin"), "%"),
+                    safe_fmt(row.get("net_margin"), "%"),
+                    safe_fmt(row.get("operating_cashflow"), " 元"),
+                    safe_fmt(row.get("operating_cashflow_to_net_profit"), " 倍"),
+                    str(row.get("operating_cashflow_yoy", "暂无可比数据")),
+                    safe_fmt(row.get("debt_ratio"), "%"),
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
+def format_raw_financial_tables(financials: dict[str, pd.DataFrame], limit: int = 20) -> str:
+    table_config = [
+        ("利润表原始数据", "income", ["end_date", "ann_date", "report_type", "total_revenue", "n_income_attr_p"]),
+        ("财务指标原始数据", "indicator", ["end_date", "ann_date", "roe", "grossprofit_margin", "netprofit_margin", "profit_dedt"]),
+        ("资产负债表原始数据", "balancesheet", ["end_date", "ann_date", "total_assets", "total_liab"]),
+        ("现金流量表原始数据", "cashflow", ["end_date", "ann_date", "n_cashflow_act"]),
+    ]
+    sections: list[str] = []
+    for title, key, columns in table_config:
+        df = financials.get(key, pd.DataFrame())
+        if df.empty:
+            sections.append(f"{title}：暂无数据")
+            continue
+        available_columns = [column for column in columns if column in df.columns]
+        raw_lines = [" | ".join(available_columns), " | ".join(["---"] * len(available_columns))]
+        for _, raw_row in df[available_columns].head(limit).iterrows():
+            raw_lines.append(" | ".join(str(raw_row.get(column, "暂无数据")) for column in available_columns))
+        sections.append(f"{title}：\n" + "\n".join(raw_lines))
+    return "\n\n".join(sections)
 
 def build_structured_text(
     stock_basic: pd.Series,
     tech: pd.DataFrame,
-    financials: dict[str, pd.Series | None],
+    financials: dict[str, pd.DataFrame],
     valuation: pd.DataFrame,
 ) -> str:
     print_step("整理结构化分析文本")
     latest = tech.iloc[-1]
     previous = tech.iloc[-2] if len(tech) >= 2 else latest
     latest_val = valuation.iloc[-1]
-    income = financials.get("income")
-    indicator = financials.get("indicator")
-    balance = financials.get("balancesheet")
-
-    debt_ratio = None
-    if balance is not None and not pd.isna(balance.get("total_assets")) and balance.get("total_assets"):
-        debt_ratio = balance.get("total_liab") / balance.get("total_assets") * 100
+    financial_trends = calculate_financial_trends(financials)
+    trend_rows = financial_trends.get("rows", [])
+    trend_conclusions = financial_trends.get("conclusions", [])
+    latest_financial = trend_rows[0] if trend_rows else {}
+    financial_table = format_financial_trend_rows(trend_rows)
+    raw_financial_tables = format_raw_financial_tables(financials)
 
     text = f"""
     股票基础信息：
@@ -282,15 +574,29 @@ def build_structured_text(
     - 最新成交量变化：{safe_fmt(latest.get('volume_change_pct'), '%')}
     - 近20个交易日涨跌幅：{safe_fmt(latest.get('return_20d_pct'), '%')}
 
-    财务数据（最新可得报告）：
-    - 报告期（利润表）：{income.get('end_date') if income is not None else '暂无数据'}
-    - 营收：{safe_fmt(income.get('total_revenue') if income is not None else None, ' 元')}
-    - 归母净利润：{safe_fmt(income.get('n_income_attr_p') if income is not None else None, ' 元')}
-    - 报告期（财务指标）：{indicator.get('end_date') if indicator is not None else '暂无数据'}
-    - ROE：{safe_fmt(indicator.get('roe') if indicator is not None else None, '%')}
-    - 毛利率：{safe_fmt(indicator.get('grossprofit_margin') if indicator is not None else None, '%')}
-    - 报告期（资产负债表）：{balance.get('end_date') if balance is not None else '暂无数据'}
-    - 资产负债率：{safe_fmt(debt_ratio, '%')}
+    财务趋势结论（基于最近 {FINANCIAL_LOOKBACK_YEARS} 年，且至少最近 {MIN_FINANCIAL_PERIODS} 个报告期）：
+    {chr(10).join(f'- {item}' for item in trend_conclusions)}
+
+    财务数据（最新可得报告摘要）：
+    - 报告期：{latest_financial.get('end_date', '暂无数据')}
+    - 营收：{safe_fmt(latest_financial.get('revenue'), ' 元')}
+    - 营收同比：{latest_financial.get('revenue_yoy', '暂无可比数据')}
+    - 归母净利润：{safe_fmt(latest_financial.get('net_profit'), ' 元')}
+    - 归母净利润同比：{latest_financial.get('net_profit_yoy', '暂无可比数据')}
+    - 扣非净利润：{safe_fmt(latest_financial.get('deducted_net_profit'), ' 元')}
+    - 扣非净利润同比：{latest_financial.get('deducted_net_profit_yoy', '暂无可比数据')}
+    - ROE：{safe_fmt(latest_financial.get('roe'), '%')}
+    - 毛利率：{safe_fmt(latest_financial.get('gross_margin'), '%')}
+    - 净利率：{safe_fmt(latest_financial.get('net_margin'), '%')}
+    - 经营现金流：{safe_fmt(latest_financial.get('operating_cashflow'), ' 元')}
+    - 经营现金流/净利润：{safe_fmt(latest_financial.get('operating_cashflow_to_net_profit'), ' 倍')}
+    - 资产负债率：{safe_fmt(latest_financial.get('debt_ratio'), '%')}
+
+    财务趋势原始计算表：
+    {financial_table}
+
+    财务报表原始数据：
+    {raw_financial_tables}
 
     估值数据：
     - PE：{safe_fmt(latest_val.get('pe'))}
