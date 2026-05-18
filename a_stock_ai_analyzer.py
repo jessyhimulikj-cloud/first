@@ -240,6 +240,125 @@ def safe_fmt(value: Any, suffix: str = "", digits: int = 2) -> str:
     return str(value)
 
 
+def _safe_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(number) or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _valuation_label(percentile: float | None, current: float | None, note: str = "") -> str:
+    if current is None or note:
+        return "极端"
+    if percentile is None:
+        return "合理"
+    if percentile <= 20:
+        return "估值偏低"
+    if percentile <= 70:
+        return "合理"
+    if percentile <= 90:
+        return "偏高"
+    return "极端"
+
+
+def _format_metric_summary(metric: dict[str, Any]) -> str:
+    percentile = metric.get("percentile")
+    percentile_text = "暂无数据" if percentile is None else f"{percentile:.1f}%"
+    note = metric.get("note") or "无"
+    return (
+        f"当前值 {safe_fmt(metric.get('current'))}；"
+        f"近1年最小值 {safe_fmt(metric.get('min'))}；"
+        f"最大值 {safe_fmt(metric.get('max'))}；"
+        f"中位数 {safe_fmt(metric.get('median'))}；"
+        f"历史分位 {percentile_text}；"
+        f"标签 {metric.get('label')}；"
+        f"说明 {note}"
+    )
+
+
+def calculate_valuation_metrics(valuation: pd.DataFrame) -> dict[str, Any]:
+    """Calculate one-year PE/PB ranges, percentiles, and valuation labels.
+
+    PE uses only positive, finite observations in a practical range because
+    negative PE usually means losses and extremely large PE values often distort
+    historical comparisons. PB uses positive, finite observations in a practical
+    range.
+    """
+    print_step("计算估值指标：PE/PB近1年区间、分位与标签")
+    metric_rules = {
+        "pe": {"upper": 1000.0, "name": "PE"},
+        "pb": {"upper": 100.0, "name": "PB"},
+    }
+    result: dict[str, Any] = {}
+
+    for metric, rule in metric_rules.items():
+        if metric not in valuation.columns or valuation.empty:
+            result[metric] = {
+                "current": None,
+                "min": None,
+                "max": None,
+                "median": None,
+                "percentile": None,
+                "label": "极端",
+                "note": f"{rule['name']}数据缺失，无法判断估值分位。",
+            }
+            continue
+
+        series = pd.to_numeric(valuation[metric], errors="coerce")
+        current = _safe_number(series.iloc[-1]) if not series.empty else None
+        upper = rule["upper"]
+        valid = series[(series > 0) & (series <= upper)].dropna()
+
+        note = ""
+        if current is None:
+            note = f"当前{rule['name']}为空，无法计算当前估值分位。"
+        elif current <= 0:
+            note = f"当前{rule['name']}为负或零，通常代表盈利为负/指标不可比。"
+        elif current > upper:
+            note = f"当前{rule['name']}超过{upper:g}，属于极端值，分位参考意义有限。"
+        elif valid.empty:
+            note = f"近1年缺少有效{rule['name']}样本，无法计算历史分位。"
+
+        if valid.empty:
+            percentile = None
+            metric_min = metric_max = metric_median = None
+        else:
+            metric_min = float(valid.min())
+            metric_max = float(valid.max())
+            metric_median = float(valid.median())
+            if note:
+                percentile = None
+            else:
+                percentile = float((valid <= current).mean() * 100)
+
+        label = _valuation_label(percentile, current, note)
+        result[metric] = {
+            "current": current,
+            "min": metric_min,
+            "max": metric_max,
+            "median": metric_median,
+            "percentile": percentile,
+            "label": label,
+            "note": note,
+        }
+
+    label_rank = {"估值偏低": 0, "合理": 1, "偏高": 2, "极端": 3}
+    overall_label = max(
+        (result["pe"]["label"], result["pb"]["label"]),
+        key=lambda label: label_rank.get(label, 3),
+    )
+    result["overall_label"] = overall_label
+    result["interpretation"] = (
+        "分位越低代表当前估值越接近近1年低位；需结合盈利质量判断是否具备吸引力，"
+        "避免仅因PE/PB低就判断便宜。"
+    )
+    print_success("估值指标计算完成")
+    return result
+
+
 def build_structured_text(
     stock_basic: pd.Series,
     tech: pd.DataFrame,
@@ -250,6 +369,7 @@ def build_structured_text(
     latest = tech.iloc[-1]
     previous = tech.iloc[-2] if len(tech) >= 2 else latest
     latest_val = valuation.iloc[-1]
+    valuation_metrics = calculate_valuation_metrics(valuation)
     income = financials.get("income")
     indicator = financials.get("indicator")
     balance = financials.get("balancesheet")
@@ -293,8 +413,10 @@ def build_structured_text(
     - 资产负债率：{safe_fmt(debt_ratio, '%')}
 
     估值数据：
-    - PE：{safe_fmt(latest_val.get('pe'))}
-    - PB：{safe_fmt(latest_val.get('pb'))}
+    - PE近1年统计：{_format_metric_summary(valuation_metrics['pe'])}
+    - PB近1年统计：{_format_metric_summary(valuation_metrics['pb'])}
+    - 综合估值标签：{valuation_metrics['overall_label']}
+    - 估值解读要求：{valuation_metrics['interpretation']}
     - 总市值：{safe_fmt(latest_val.get('total_mv'), ' 万元')}
     - 流通市值：{safe_fmt(latest_val.get('circ_mv'), ' 万元')}
     - 换手率：{safe_fmt(latest_val.get('turnover_rate'), '%')}
@@ -325,7 +447,9 @@ def call_deepseek(config: Config, structured_text: str) -> str:
     5. 综合评分（0-100，并解释依据）
     6. 是否适合当前买入（只能使用审慎、观望、分批关注等非绝对表述）
 
-    请使用中文，结构清晰，避免夸大收益，最后再次注明“{DISCLAIMER}”。
+    请使用中文，结构清晰，避免夸大收益。评价估值吸引力时，必须结合盈利质量
+    （如净利润、ROE、毛利率、资产负债率）与估值分位，不要孤立评价 PE/PB。
+    最后再次注明“{DISCLAIMER}”。
 
     数据如下：
     {structured_text}
