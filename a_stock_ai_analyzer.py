@@ -21,12 +21,17 @@ from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
-import requests
 import tushare as ts
 
+from deepseek_client import (
+    DEFAULT_DEEPSEEK_MODEL,
+    SUPPORTED_PROMPT_TEMPLATES,
+    DeepSeekClient,
+    DeepSeekClientError,
+    PromptTemplateName,
+)
+
 DISCLAIMER = "仅供参考，不构成投资建议。市场有风险，投资需谨慎。"
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
 
 
 class AnalyzerError(Exception):
@@ -310,59 +315,30 @@ def build_structured_text(
     return structured
 
 
-def call_deepseek(config: Config, structured_text: str) -> str:
-    print_step("调用 DeepSeek API 生成深度分析报告")
-    system_prompt = (
-        "你是严谨的A股研究助理。请基于用户提供的数据生成分析报告，"
-        "不得编造未提供的数据，不得给出绝对买卖指令，必须明确提示：仅供参考，不构成投资建议。"
+def create_deepseek_client(config: Config) -> DeepSeekClient:
+    """Create the unified DeepSeek client used by every AI report path."""
+    return DeepSeekClient(
+        api_key=config.deepseek_api_key,
+        model=config.deepseek_model,
+        disclaimer=DISCLAIMER,
     )
-    user_prompt = f"""
-    请基于以下结构化数据，生成 A 股股票 AI 投资分析报告，必须包含：
-    1. 短期投资建议（3-5个交易日）
-    2. 中期投资建议（2-3个月）
-    3. 长期投资建议（1年左右）
-    4. 风险提示
-    5. 综合评分（0-100，并解释依据）
-    6. 是否适合当前买入（只能使用审慎、观望、分批关注等非绝对表述）
 
-    请使用中文，结构清晰，避免夸大收益，最后再次注明“{DISCLAIMER}”。
 
-    数据如下：
-    {structured_text}
-    """
-    payload = {
-        "model": config.deepseek_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": textwrap.dedent(user_prompt).strip()},
-        ],
-        "temperature": 0.3,
-        "stream": False,
-    }
-    headers = {
-        "Authorization": f"Bearer {config.deepseek_api_key}",
-        "Content-Type": "application/json",
-    }
+def generate_ai_report(
+    config: Config, structured_text: str, report_type: PromptTemplateName
+) -> str:
+    """Generate an AI report through the shared DeepSeek client."""
+    print_step(f"调用 DeepSeek API 生成 {report_type} 报告")
+    client = create_deepseek_client(config)
     try:
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=90)
-        response.raise_for_status()
-        data = response.json()
-        content = data["choices"][0]["message"]["content"].strip()
-    except requests.Timeout as exc:
-        raise AnalyzerError("DeepSeek API 请求超时，请稍后重试或检查网络。") from exc
-    except requests.RequestException as exc:
-        detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
-        raise AnalyzerError(f"DeepSeek API 调用失败：{detail}") from exc
-    except (KeyError, IndexError, ValueError) as exc:
-        raise AnalyzerError(f"DeepSeek API 返回格式异常：{exc}") from exc
-
-    if DISCLAIMER not in content:
-        content = f"{content}\n\n{DISCLAIMER}"
+        report = client.analyze_structured_data(structured_text, template=report_type)
+    except DeepSeekClientError as exc:
+        raise AnalyzerError(str(exc)) from exc
     print_success("DeepSeek 分析报告生成完成")
-    return content
+    return report
 
 
-def analyze_stock(raw_code: str) -> str:
+def analyze_stock(raw_code: str, report_type: PromptTemplateName = "basic_report") -> str:
     print("=" * 72)
     print("A股股票 AI 投资分析系统 - 第一版")
     print(DISCLAIMER)
@@ -385,13 +361,19 @@ def analyze_stock(raw_code: str) -> str:
     print(structured_text)
     print("-" * 72)
 
-    report = call_deepseek(config, structured_text)
+    report = generate_ai_report(config, structured_text, report_type)
     return report
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="A股股票 AI 投资分析系统")
     parser.add_argument("stock_code", nargs="?", help="6 位 A 股股票代码，例如 002594；也支持 002594.SZ")
+    parser.add_argument(
+        "--report-type",
+        choices=SUPPORTED_PROMPT_TEMPLATES,
+        default="basic_report",
+        help="DeepSeek Prompt 模板类型，默认 basic_report。",
+    )
     return parser.parse_args()
 
 
@@ -399,7 +381,7 @@ def main() -> int:
     args = parse_args()
     raw_code = args.stock_code or input("请输入股票代码（例如 002594）：").strip()
     try:
-        report = analyze_stock(raw_code)
+        report = analyze_stock(raw_code, args.report_type)
     except AnalyzerError as exc:
         print(f"\n[错误] {exc}")
         print(f"[免责声明] {DISCLAIMER}")
