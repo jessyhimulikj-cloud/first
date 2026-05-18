@@ -240,16 +240,86 @@ def safe_fmt(value: Any, suffix: str = "", digits: int = 2) -> str:
     return str(value)
 
 
+@dataclass(frozen=True)
+class MarketValuationSnapshot:
+    latest: pd.Series
+    previous: pd.Series
+    latest_val: pd.Series
+    aligned_trade_date: Any
+    latest_market_trade_date: Any
+    latest_valuation_trade_date: Any
+
+    @property
+    def has_date_gap(self) -> bool:
+        return self.latest_market_trade_date != self.latest_valuation_trade_date
+
+
+def align_market_and_valuation(tech: pd.DataFrame, valuation: pd.DataFrame) -> MarketValuationSnapshot:
+    """Align technical indicators and valuation data on their latest common trade date."""
+    print_step("按交易日对齐行情技术指标与估值数据")
+    if tech.empty:
+        raise AnalyzerError("技术指标数据为空，无法进行数据对齐。")
+    if valuation.empty:
+        raise AnalyzerError("估值数据为空，无法进行数据对齐。")
+    if "trade_date" not in tech.columns or "trade_date" not in valuation.columns:
+        raise AnalyzerError("技术指标和估值数据都必须包含 trade_date 字段才能对齐。")
+
+    tech_sorted = tech.sort_values("trade_date").reset_index(drop=True)
+    valuation_sorted = valuation.sort_values("trade_date").reset_index(drop=True)
+    latest_market_trade_date = tech_sorted["trade_date"].iloc[-1]
+    latest_valuation_trade_date = valuation_sorted["trade_date"].iloc[-1]
+
+    aligned = tech_sorted.merge(
+        valuation_sorted,
+        on="trade_date",
+        how="inner",
+        suffixes=("", "_valuation"),
+    ).sort_values("trade_date")
+    if aligned.empty:
+        raise AnalyzerError("技术指标和估值数据没有重叠交易日，无法生成一致的结构化分析文本。")
+
+    aligned_trade_date = aligned["trade_date"].iloc[-1]
+    latest = tech_sorted[tech_sorted["trade_date"] == aligned_trade_date].iloc[-1]
+    latest_val = valuation_sorted[valuation_sorted["trade_date"] == aligned_trade_date].iloc[-1]
+    previous_candidates = tech_sorted[tech_sorted["trade_date"] < aligned_trade_date]
+    previous = previous_candidates.iloc[-1] if not previous_candidates.empty else latest
+
+    if latest_market_trade_date != latest_valuation_trade_date:
+        print_warning(
+            "最新行情日与最新估值日不一致："
+            f"行情 {latest_market_trade_date}，估值 {latest_valuation_trade_date}；"
+            f"将使用共同最新交易日 {aligned_trade_date}。"
+        )
+    print_success(f"行情与估值数据已对齐到交易日 {aligned_trade_date}")
+    return MarketValuationSnapshot(
+        latest=latest,
+        previous=previous,
+        latest_val=latest_val,
+        aligned_trade_date=aligned_trade_date,
+        latest_market_trade_date=latest_market_trade_date,
+        latest_valuation_trade_date=latest_valuation_trade_date,
+    )
+
+
 def build_structured_text(
     stock_basic: pd.Series,
-    tech: pd.DataFrame,
+    market_snapshot: MarketValuationSnapshot,
     financials: dict[str, pd.Series | None],
-    valuation: pd.DataFrame,
 ) -> str:
     print_step("整理结构化分析文本")
-    latest = tech.iloc[-1]
-    previous = tech.iloc[-2] if len(tech) >= 2 else latest
-    latest_val = valuation.iloc[-1]
+    latest = market_snapshot.latest
+    previous = market_snapshot.previous
+    latest_val = market_snapshot.latest_val
+    if market_snapshot.has_date_gap:
+        alignment_note = (
+            "最新行情日与最新估值日不一致："
+            f"最新行情日为 {market_snapshot.latest_market_trade_date}，"
+            f"最新估值日为 {market_snapshot.latest_valuation_trade_date}；"
+            f"为避免错配，以下行情与估值均使用二者都有数据的最新交易日 "
+            f"{market_snapshot.aligned_trade_date}。"
+        )
+    else:
+        alignment_note = f"行情与估值数据已按交易日 {market_snapshot.aligned_trade_date} 对齐。"
     income = financials.get("income")
     indicator = financials.get("indicator")
     balance = financials.get("balancesheet")
@@ -266,6 +336,9 @@ def build_structured_text(
     - 行业：{stock_basic.get('industry')}
     - 市场：{stock_basic.get('market')}
     - 上市日期：{stock_basic.get('list_date')}
+
+    数据对齐说明：
+    - {alignment_note}
 
     最新行情与技术指标：
     - 最新交易日：{latest.get('trade_date')}
@@ -378,7 +451,8 @@ def analyze_stock(raw_code: str) -> str:
     tech = calculate_technical_indicators(daily)
     valuation = get_daily_basic(pro, ts_code)
     financials = get_financial_data(pro, ts_code)
-    structured_text = build_structured_text(stock_basic, tech, financials, valuation)
+    market_snapshot = align_market_and_valuation(tech, valuation)
+    structured_text = build_structured_text(stock_basic, market_snapshot, financials)
 
     print("\n" + "-" * 72)
     print("已整理的数据摘要：")
