@@ -158,6 +158,159 @@ def get_daily_basic(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
     return df.sort_values("trade_date").reset_index(drop=True)
 
 
+def get_industry_peers(pro: ts.pro_api, industry: str | None) -> list[str]:
+    """Return listed A-share ts_codes in the same Tushare industry."""
+    if industry is None or pd.isna(industry) or not str(industry).strip():
+        print_warning("股票行业信息为空，跳过行业对比")
+        return []
+
+    industry_name = str(industry).strip()
+    df = call_tushare(
+        pro.stock_basic,
+        f"{industry_name} 行业股票列表",
+        exchange="",
+        list_status="L",
+        fields="ts_code,name,industry",
+    )
+    peers = df[df["industry"] == industry_name]["ts_code"].dropna().astype(str).unique().tolist()
+    if not peers:
+        print_warning(f"未找到 {industry_name} 行业同行股票，跳过行业对比")
+    else:
+        print_success(f"找到 {len(peers)} 只 {industry_name} 行业股票")
+    return peers
+
+
+def _latest_row_by_date(df: pd.DataFrame, date_column: str = "trade_date") -> pd.Series | None:
+    if df is None or df.empty or date_column not in df.columns:
+        return None
+    return df.sort_values(date_column, ascending=False).iloc[0]
+
+
+def _calculate_return_20d_from_basic(daily_basic: pd.DataFrame) -> float | None:
+    if daily_basic is None or daily_basic.empty or "close" not in daily_basic.columns:
+        return None
+    ordered = daily_basic.sort_values("trade_date").reset_index(drop=True)
+    close = pd.to_numeric(ordered["close"], errors="coerce").dropna()
+    if len(close) < 21 or close.iloc[-21] == 0:
+        return None
+    return (close.iloc[-1] / close.iloc[-21] - 1) * 100
+
+
+def get_peer_valuation_snapshot(pro: ts.pro_api, peer_codes: list[str]) -> pd.DataFrame:
+    """Fetch latest daily_basic and fina_indicator snapshots for industry peers."""
+    if not peer_codes:
+        return pd.DataFrame()
+
+    end_date = dt.datetime.now().strftime("%Y%m%d")
+    start_date = (dt.datetime.now() - dt.timedelta(days=90)).strftime("%Y%m%d")
+    rows: list[dict[str, Any]] = []
+
+    print_step("获取同行最近一期估值、财务指标与近20日涨跌幅")
+    for index, ts_code in enumerate(peer_codes, start=1):
+        try:
+            daily_basic = pro.daily_basic(
+                ts_code=ts_code,
+                start_date=start_date,
+                end_date=end_date,
+                fields="ts_code,trade_date,close,pe,pb,total_mv,circ_mv",
+            )
+        except Exception as exc:
+            print_warning(f"{ts_code} 同行估值数据获取失败：{exc}")
+            continue
+
+        latest_basic = _latest_row_by_date(daily_basic)
+        if latest_basic is None:
+            print_warning(f"{ts_code} 同行估值数据为空")
+            continue
+
+        latest_indicator = None
+        try:
+            indicator = pro.fina_indicator(
+                ts_code=ts_code,
+                fields="ts_code,end_date,ann_date,roe,grossprofit_margin",
+            )
+            latest_indicator = _latest_row_by_date(indicator, "end_date")
+        except Exception as exc:
+            print_warning(f"{ts_code} 同行财务指标获取失败：{exc}")
+
+        rows.append(
+            {
+                "ts_code": ts_code,
+                "trade_date": latest_basic.get("trade_date"),
+                "pe": latest_basic.get("pe"),
+                "pb": latest_basic.get("pb"),
+                "total_mv": latest_basic.get("total_mv"),
+                "circ_mv": latest_basic.get("circ_mv"),
+                "return_20d_pct": _calculate_return_20d_from_basic(daily_basic),
+                "indicator_end_date": latest_indicator.get("end_date") if latest_indicator is not None else None,
+                "roe": latest_indicator.get("roe") if latest_indicator is not None else None,
+                "grossprofit_margin": latest_indicator.get("grossprofit_margin") if latest_indicator is not None else None,
+            }
+        )
+
+        if index % 20 == 0:
+            print_success(f"已获取 {index}/{len(peer_codes)} 只同行股票快照")
+
+    peer_df = pd.DataFrame(rows)
+    if peer_df.empty:
+        print_warning("同行快照数据为空，跳过行业相对位置计算")
+    else:
+        numeric_columns = ["pe", "pb", "total_mv", "circ_mv", "return_20d_pct", "roe", "grossprofit_margin"]
+        for column in numeric_columns:
+            peer_df[column] = pd.to_numeric(peer_df[column], errors="coerce")
+        print_success(f"同行快照获取完成，共 {len(peer_df)} 条可用记录")
+    return peer_df
+
+
+def calculate_peer_percentiles(target_code: str, peer_df: pd.DataFrame) -> dict[str, Any]:
+    """Calculate target stock percentiles within its industry peer snapshot."""
+    if peer_df is None or peer_df.empty:
+        return {"available": False, "reason": "同行数据为空"}
+
+    matched = peer_df[peer_df["ts_code"] == target_code]
+    if matched.empty:
+        return {"available": False, "reason": f"同行快照中缺少目标股票 {target_code}"}
+
+    target = matched.iloc[0]
+    metrics = {
+        "pe": "PE",
+        "pb": "PB",
+        "roe": "ROE",
+        "grossprofit_margin": "毛利率",
+        "total_mv": "总市值",
+        "return_20d_pct": "近20日涨跌幅",
+    }
+    result: dict[str, Any] = {
+        "available": True,
+        "peer_count": int(len(peer_df)),
+        "target_code": target_code,
+        "trade_date": target.get("trade_date"),
+        "indicator_end_date": target.get("indicator_end_date"),
+        "metrics": {},
+    }
+
+    for column, label in metrics.items():
+        if column in peer_df.columns:
+            series = pd.to_numeric(peer_df[column], errors="coerce").dropna()
+        else:
+            series = pd.Series(dtype="float64")
+        value = pd.to_numeric(pd.Series([target.get(column)]), errors="coerce").iloc[0]
+        if pd.isna(value) or series.empty:
+            percentile = None
+            valid_count = int(series.count())
+        else:
+            percentile = float((series <= value).mean() * 100)
+            valid_count = int(series.count())
+        result["metrics"][column] = {
+            "label": label,
+            "value": value if not pd.isna(value) else None,
+            "percentile": percentile,
+            "valid_count": valid_count,
+        }
+
+    return result
+
+
 def get_financial_data(pro: ts.pro_api, ts_code: str) -> dict[str, pd.Series | None]:
     financials: dict[str, pd.Series | None] = {"income": None, "indicator": None, "balancesheet": None}
 
@@ -240,11 +393,37 @@ def safe_fmt(value: Any, suffix: str = "", digits: int = 2) -> str:
     return str(value)
 
 
+def build_industry_relative_section(peer_percentiles: dict[str, Any] | None) -> str:
+    if not peer_percentiles:
+        return "行业相对位置：\n- 暂无同行对比数据"
+    if not peer_percentiles.get("available"):
+        return f"行业相对位置：\n- 暂无同行对比数据：{peer_percentiles.get('reason', '原因未知')}"
+
+    metric_lines = []
+    for key in ("pe", "pb", "roe", "grossprofit_margin", "total_mv", "return_20d_pct"):
+        metric = peer_percentiles.get("metrics", {}).get(key, {})
+        label = metric.get("label", key)
+        suffix = "%" if key in {"roe", "grossprofit_margin", "return_20d_pct"} else ""
+        value = safe_fmt(metric.get("value"), suffix)
+        percentile = safe_fmt(metric.get("percentile"), "%")
+        valid_count = metric.get("valid_count", 0)
+        metric_lines.append(f"- {label}：{value}，行业分位数：{percentile}（有效样本 {valid_count} 只）")
+
+    header = [
+        "行业相对位置：",
+        f"- 同行业样本数：{peer_percentiles.get('peer_count')} 只",
+        f"- 估值交易日：{peer_percentiles.get('trade_date') or '暂无数据'}",
+        f"- 财务指标报告期：{peer_percentiles.get('indicator_end_date') or '暂无数据'}",
+    ]
+    return "\n".join(header + metric_lines)
+
+
 def build_structured_text(
     stock_basic: pd.Series,
     tech: pd.DataFrame,
     financials: dict[str, pd.Series | None],
     valuation: pd.DataFrame,
+    peer_percentiles: dict[str, Any] | None = None,
 ) -> str:
     print_step("整理结构化分析文本")
     latest = tech.iloc[-1]
@@ -257,6 +436,8 @@ def build_structured_text(
     debt_ratio = None
     if balance is not None and not pd.isna(balance.get("total_assets")) and balance.get("total_assets"):
         debt_ratio = balance.get("total_liab") / balance.get("total_assets") * 100
+
+    industry_relative_section = build_industry_relative_section(peer_percentiles)
 
     text = f"""
     股票基础信息：
@@ -300,6 +481,8 @@ def build_structured_text(
     - 换手率：{safe_fmt(latest_val.get('turnover_rate'), '%')}
     - 量比：{safe_fmt(latest_val.get('volume_ratio'))}
 
+    {industry_relative_section}
+
     分析周期定义：
     - 短期：3-5个交易日
     - 中期：2-3个月
@@ -324,6 +507,7 @@ def call_deepseek(config: Config, structured_text: str) -> str:
     4. 风险提示
     5. 综合评分（0-100，并解释依据）
     6. 是否适合当前买入（只能使用审慎、观望、分批关注等非绝对表述）
+    7. 行业相对位置判断：必须基于“行业相对位置”数据，明确回答该股是行业内高估、低估、盈利能力领先、盈利能力落后，还是估值与质量匹配；如数据不足，请说明无法判断。
 
     请使用中文，结构清晰，避免夸大收益，最后再次注明“{DISCLAIMER}”。
 
@@ -378,7 +562,12 @@ def analyze_stock(raw_code: str) -> str:
     tech = calculate_technical_indicators(daily)
     valuation = get_daily_basic(pro, ts_code)
     financials = get_financial_data(pro, ts_code)
-    structured_text = build_structured_text(stock_basic, tech, financials, valuation)
+    peer_codes = get_industry_peers(pro, stock_basic.get("industry"))
+    if ts_code not in peer_codes:
+        peer_codes.append(ts_code)
+    peer_snapshot = get_peer_valuation_snapshot(pro, peer_codes)
+    peer_percentiles = calculate_peer_percentiles(ts_code, peer_snapshot)
+    structured_text = build_structured_text(stock_basic, tech, financials, valuation, peer_percentiles)
 
     print("\n" + "-" * 72)
     print("已整理的数据摘要：")
