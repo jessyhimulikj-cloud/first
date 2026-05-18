@@ -40,6 +40,15 @@ class Config:
     deepseek_model: str = DEFAULT_DEEPSEEK_MODEL
 
 
+@dataclass(frozen=True)
+class AnalysisOptions:
+    horizon: str = "medium"
+    risk: str = "medium"
+    position: str = "none"
+    cost: float | None = None
+    capital_action: str | None = None
+
+
 def print_step(message: str) -> None:
     """Print a clear step message for terminal users."""
     print(f"\n[步骤] {message}")
@@ -240,11 +249,39 @@ def safe_fmt(value: Any, suffix: str = "", digits: int = 2) -> str:
     return str(value)
 
 
+def build_user_context_text(options: AnalysisOptions) -> str:
+    horizon_labels = {"short": "短期（3-5个交易日）", "medium": "中期（2-3个月）", "long": "长期（1年左右）"}
+    risk_labels = {"low": "低风险承受能力", "medium": "中等风险承受能力", "high": "高风险承受能力"}
+    position_labels = {
+        "none": "空仓",
+        "holding": "已持仓（盈亏状态未明确）",
+        "profit": "已持仓且当前盈利",
+        "loss": "已持仓且当前亏损",
+    }
+    capital_action_labels = {
+        "watch": "观察/等待",
+        "build": "计划建仓",
+        "add": "考虑加仓",
+        "reduce": "考虑减仓",
+    }
+
+    lines = [
+        "用户投资状态与偏好：",
+        f"- 关注周期：{horizon_labels[options.horizon]}",
+        f"- 风险偏好：{risk_labels[options.risk]}",
+        f"- 持仓状态：{position_labels[options.position]}",
+        f"- 持仓成本：{safe_fmt(options.cost) if options.cost is not None else '未提供'}",
+        f"- 计划资金动作：{capital_action_labels.get(options.capital_action, '未提供')}",
+    ]
+    return "\n".join(lines)
+
+
 def build_structured_text(
     stock_basic: pd.Series,
     tech: pd.DataFrame,
     financials: dict[str, pd.Series | None],
     valuation: pd.DataFrame,
+    options: AnalysisOptions,
 ) -> str:
     print_step("整理结构化分析文本")
     latest = tech.iloc[-1]
@@ -258,7 +295,11 @@ def build_structured_text(
     if balance is not None and not pd.isna(balance.get("total_assets")) and balance.get("total_assets"):
         debt_ratio = balance.get("total_liab") / balance.get("total_assets") * 100
 
+    user_context_text = build_user_context_text(options)
+
     text = f"""
+    {user_context_text}
+
     股票基础信息：
     - 代码：{stock_basic.get('ts_code')}
     - 名称：{stock_basic.get('name')}
@@ -321,9 +362,16 @@ def call_deepseek(config: Config, structured_text: str) -> str:
     1. 短期投资建议（3-5个交易日）
     2. 中期投资建议（2-3个月）
     3. 长期投资建议（1年左右）
-    4. 风险提示
-    5. 综合评分（0-100，并解释依据）
-    6. 是否适合当前买入（只能使用审慎、观望、分批关注等非绝对表述）
+    4. 结合用户关注周期、风险偏好、持仓状态、持仓成本和计划资金动作的个性化建议
+    5. 风险提示
+    6. 综合评分（0-100，并解释依据）
+    7. 是否适合当前买入（只能使用审慎、观望、分批关注等非绝对表述）
+
+    个性化建议要求：
+    - 空仓用户：说明适合继续等待的条件，以及可考虑分批关注/分批建仓的条件。
+    - 已持仓盈利用户：说明止盈思路、分批落袋条件和回撤管理方式。
+    - 已持仓亏损用户：说明补仓前提、止损条件，以及是否继续持有的观察条件。
+    - 已持仓但未说明盈亏用户：同时给出盈利和亏损两种情形下的管理框架。
 
     请使用中文，结构清晰，避免夸大收益，最后再次注明“{DISCLAIMER}”。
 
@@ -362,11 +410,13 @@ def call_deepseek(config: Config, structured_text: str) -> str:
     return content
 
 
-def analyze_stock(raw_code: str) -> str:
+def analyze_stock(raw_code: str, options: AnalysisOptions | None = None) -> str:
     print("=" * 72)
     print("A股股票 AI 投资分析系统 - 第一版")
     print(DISCLAIMER)
     print("=" * 72)
+
+    options = options or AnalysisOptions()
 
     config = load_config()
     ts_code = normalize_stock_code(raw_code)
@@ -378,7 +428,7 @@ def analyze_stock(raw_code: str) -> str:
     tech = calculate_technical_indicators(daily)
     valuation = get_daily_basic(pro, ts_code)
     financials = get_financial_data(pro, ts_code)
-    structured_text = build_structured_text(stock_basic, tech, financials, valuation)
+    structured_text = build_structured_text(stock_basic, tech, financials, valuation, options)
 
     print("\n" + "-" * 72)
     print("已整理的数据摘要：")
@@ -392,14 +442,35 @@ def analyze_stock(raw_code: str) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="A股股票 AI 投资分析系统")
     parser.add_argument("stock_code", nargs="?", help="6 位 A 股股票代码，例如 002594；也支持 002594.SZ")
+    parser.add_argument("--horizon", choices=("short", "medium", "long"), default="medium", help="关注周期：short / medium / long")
+    parser.add_argument("--risk", choices=("low", "medium", "high"), default="medium", help="风险偏好：low / medium / high")
+    parser.add_argument(
+        "--position",
+        choices=("none", "holding", "profit", "loss"),
+        default="none",
+        help="持仓状态：none / holding / profit / loss",
+    )
+    parser.add_argument("--cost", type=float, help="用户持仓成本，可选")
+    parser.add_argument(
+        "--capital-action",
+        choices=("watch", "build", "add", "reduce"),
+        help="计划资金动作：watch / build / add / reduce，可选",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     raw_code = args.stock_code or input("请输入股票代码（例如 002594）：").strip()
+    options = AnalysisOptions(
+        horizon=args.horizon,
+        risk=args.risk,
+        position=args.position,
+        cost=args.cost,
+        capital_action=args.capital_action,
+    )
     try:
-        report = analyze_stock(raw_code)
+        report = analyze_stock(raw_code, options)
     except AnalyzerError as exc:
         print(f"\n[错误] {exc}")
         print(f"[免责声明] {DISCLAIMER}")
