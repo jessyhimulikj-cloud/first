@@ -206,6 +206,264 @@ def get_financial_data(pro: ts.pro_api, ts_code: str) -> dict[str, pd.Series | N
     return financials
 
 
+
+
+def format_tushare_date(value: Any) -> str:
+    """Return a compact Tushare date value as YYYYMMDD text when possible."""
+    if value is None or pd.isna(value):
+        return ""
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.strftime("%Y%m%d")
+    text = str(value).strip()
+    if not text:
+        return ""
+    return text.replace("-", "")[:8]
+
+
+def normalize_event_frame(df: pd.DataFrame, event_type: str, date_columns: tuple[str, ...]) -> pd.DataFrame:
+    """Normalize one optional Tushare event frame into a shared event schema."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    normalized = df.copy()
+    normalized["event_type"] = event_type
+    normalized["event_date"] = ""
+    for column in date_columns:
+        if column in normalized.columns:
+            normalized["event_date"] = normalized[column].apply(format_tushare_date)
+            break
+
+    return normalized
+
+
+def call_optional_tushare(func: Any, friendly_name: str, **kwargs: Any) -> pd.DataFrame:
+    """Call a best-effort Tushare endpoint without aborting the whole analysis."""
+    print_step(f"尝试获取{friendly_name}")
+    try:
+        df = func(**kwargs)
+    except Exception as exc:  # Tushare permissions and endpoint availability vary by account.
+        print_warning(f"{friendly_name}获取失败，已跳过：{exc}")
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        print_warning(f"{friendly_name}为空，已跳过")
+        return pd.DataFrame()
+
+    print_success(f"{friendly_name}获取成功，共 {len(df)} 条记录")
+    return df
+
+
+def get_recent_events(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
+    """Fetch recent stock events from available Tushare Pro endpoints.
+
+    The Tushare permission matrix differs by account, so this function treats
+    every event endpoint as optional and returns whatever can be fetched. It
+    prioritizes confirmed company events and then market/news catalysts for
+    the last 90 calendar days.
+    """
+    end_date = dt.datetime.now().strftime("%Y%m%d")
+    start_date = (dt.datetime.now() - dt.timedelta(days=90)).strftime("%Y%m%d")
+    symbol = ts_code.split(".")[0]
+    stock_name = ""
+    industry = ""
+    basic_func = getattr(pro, "stock_basic", None)
+    if basic_func is not None:
+        basic_df = call_optional_tushare(
+            basic_func,
+            "事件检索辅助基础信息",
+            exchange="",
+            list_status="L",
+            fields="ts_code,name,industry",
+        )
+        if not basic_df.empty and "ts_code" in basic_df.columns:
+            matched = basic_df[basic_df["ts_code"] == ts_code]
+            if not matched.empty:
+                stock_name = str(matched.iloc[0].get("name", "") or "").strip()
+                industry = str(matched.iloc[0].get("industry", "") or "").strip()
+    frames: list[pd.DataFrame] = []
+
+    event_requests = [
+        {
+            "func_name": "forecast",
+            "friendly_name": "业绩预告",
+            "event_type": "业绩预告",
+            "date_columns": ("ann_date", "end_date"),
+            "kwargs": {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "fields": "ts_code,ann_date,end_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max,last_parent_net,first_ann_date,summary,change_reason",
+            },
+        },
+        {
+            "func_name": "express",
+            "friendly_name": "业绩快报",
+            "event_type": "业绩快报",
+            "date_columns": ("ann_date", "end_date"),
+            "kwargs": {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "fields": "ts_code,ann_date,end_date,revenue,operate_profit,total_profit,n_income,total_assets,diluted_eps,diluted_roe,yoy_net_profit,bps,perf_summary,is_audit,remark",
+            },
+        },
+        {
+            "func_name": "anns",
+            "friendly_name": "重大公告",
+            "event_type": "重大公告",
+            "date_columns": ("ann_date",),
+            "kwargs": {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "fields": "ts_code,ann_date,title,url,rec_time",
+            },
+        },
+        {
+            "func_name": "dividend",
+            "friendly_name": "分红送转",
+            "event_type": "分红送转",
+            "date_columns": ("ann_date", "record_date", "ex_date", "imp_ann_date"),
+            "kwargs": {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "fields": "ts_code,end_date,ann_date,div_proc,stk_div,stk_bo_rate,stk_co_rate,cash_div,cash_div_tax,record_date,ex_date,pay_date,div_listdate,imp_ann_date,base_date,base_share",
+            },
+        },
+        {
+            "func_name": "share_float",
+            "friendly_name": "限售股解禁",
+            "event_type": "限售股解禁",
+            "date_columns": ("float_date", "ann_date"),
+            "kwargs": {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "fields": "ts_code,ann_date,float_date,float_share,float_ratio,holder_name,share_type",
+            },
+        },
+        {
+            "func_name": "top_list",
+            "friendly_name": "龙虎榜",
+            "event_type": "龙虎榜",
+            "date_columns": ("trade_date",),
+            "kwargs": {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "fields": "trade_date,ts_code,name,close,pct_change,turnover_rate,amount,l_sell,l_buy,l_amount,net_amount,net_rate,amount_rate,float_values,reason",
+            },
+        },
+        {
+            "func_name": "stk_holdertrade",
+            "friendly_name": "股东增减持",
+            "event_type": "股东增减持",
+            "date_columns": ("ann_date", "begin_date", "close_date"),
+            "kwargs": {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "fields": "ts_code,ann_date,holder_name,holder_type,in_de,change_vol,change_ratio,after_share,after_ratio,avg_price,total_share,begin_date,close_date",
+            },
+        },
+        {
+            "func_name": "news",
+            "friendly_name": "新闻摘要",
+            "event_type": "新闻摘要",
+            "date_columns": ("datetime",),
+            "kwargs": {
+                "start_date": start_date,
+                "end_date": end_date,
+                "src": "sina",
+                "fields": "datetime,content,title,channels",
+            },
+            "post_filter": "news",
+        },
+    ]
+
+    for request in event_requests:
+        func = getattr(pro, request["func_name"], None)
+        if func is None:
+            print_warning(f"Tushare 当前客户端不支持{request['friendly_name']}接口，已跳过")
+            continue
+
+        df = call_optional_tushare(func, request["friendly_name"], **request["kwargs"])
+        if df.empty:
+            continue
+
+        if request.get("post_filter") == "news":
+            text_columns = [column for column in ("title", "content") if column in df.columns]
+            if text_columns:
+                mask = pd.Series(False, index=df.index)
+                stock_name_markers = [marker for marker in (symbol, ts_code, stock_name, industry) if marker]
+                for column in text_columns:
+                    column_text = df[column].fillna("").astype(str)
+                    for marker in stock_name_markers:
+                        mask = mask | column_text.str.contains(marker, case=False, regex=False)
+                df = df[mask]
+            if df.empty:
+                print_warning("新闻摘要未匹配到股票代码相关内容，已跳过")
+                continue
+
+        normalized = normalize_event_frame(df, request["event_type"], request["date_columns"])
+        if not normalized.empty:
+            frames.append(normalized)
+
+    if not frames:
+        print_warning("最近 90 天事件数据为空或当前 Tushare 权限不可用")
+        return pd.DataFrame()
+
+    events = pd.concat(frames, ignore_index=True, sort=False)
+    events = events[events["event_date"].astype(str) >= start_date]
+    events = events.sort_values("event_date", ascending=False, na_position="last").reset_index(drop=True)
+    print_success(f"事件数据整理完成，共 {len(events)} 条可用记录")
+    return events
+
+
+def summarize_events(events_df: pd.DataFrame) -> str:
+    """Summarize normalized recent events for the model prompt."""
+    if events_df is None or events_df.empty:
+        return "最近 90 天未获取到可用事件数据；可能是无相关事件、接口权限不足或数据源暂不可用。"
+
+    def pick(row: pd.Series, columns: tuple[str, ...]) -> str:
+        parts = []
+        for column in columns:
+            if column in row.index and not pd.isna(row.get(column)):
+                value = str(row.get(column)).strip()
+                if value and value.lower() != "nan":
+                    parts.append(f"{column}={value}")
+        return "；".join(parts)
+
+    summary_fields = {
+        "业绩预告": ("type", "p_change_min", "p_change_max", "net_profit_min", "net_profit_max", "summary", "change_reason"),
+        "业绩快报": ("revenue", "n_income", "yoy_net_profit", "diluted_eps", "diluted_roe", "perf_summary", "remark"),
+        "重大公告": ("title", "url"),
+        "分红送转": ("div_proc", "stk_div", "stk_bo_rate", "stk_co_rate", "cash_div", "cash_div_tax", "record_date", "ex_date", "pay_date"),
+        "限售股解禁": ("float_date", "float_share", "float_ratio", "holder_name", "share_type"),
+        "龙虎榜": ("close", "pct_change", "turnover_rate", "amount", "net_amount", "reason"),
+        "股东增减持": ("holder_name", "holder_type", "in_de", "change_vol", "change_ratio", "avg_price", "begin_date", "close_date"),
+        "新闻摘要": ("datetime", "title", "content", "channels"),
+    }
+
+    lines = ["最近 90 天事件数据（来自当前 Tushare 权限可获取接口；新闻为未验证线索，需交叉验证）："]
+    preferred_order = ["业绩预告", "业绩快报", "重大公告", "分红送转", "限售股解禁", "龙虎榜", "股东增减持", "新闻摘要"]
+    for event_type in preferred_order:
+        group = events_df[events_df["event_type"] == event_type]
+        if group.empty:
+            lines.append(f"- {event_type}：暂无可用数据。")
+            continue
+
+        lines.append(f"- {event_type}：共 {len(group)} 条，最近记录如下：")
+        for _, row in group.head(5).iterrows():
+            detail = pick(row, summary_fields.get(event_type, tuple(row.index)))
+            if len(detail) > 500:
+                detail = detail[:500] + "..."
+            lines.append(f"  * 日期 {row.get('event_date') or '未知'}：{detail or '暂无详情字段'}")
+
+    return "\n".join(lines)
+
+
 def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(window=period).mean()
@@ -364,6 +622,7 @@ def build_structured_text(
     tech: pd.DataFrame,
     financials: dict[str, pd.Series | None],
     valuation: pd.DataFrame,
+    events_summary: str,
 ) -> str:
     print_step("整理结构化分析文本")
     latest = tech.iloc[-1]
@@ -422,6 +681,9 @@ def build_structured_text(
     - 换手率：{safe_fmt(latest_val.get('turnover_rate'), '%')}
     - 量比：{safe_fmt(latest_val.get('volume_ratio'))}
 
+    近期事件与潜在催化剂：
+    {events_summary}
+
     分析周期定义：
     - 短期：3-5个交易日
     - 中期：2-3个月
@@ -437,6 +699,7 @@ def call_deepseek(config: Config, structured_text: str) -> str:
     system_prompt = (
         "你是严谨的A股研究助理。请基于用户提供的数据生成分析报告，"
         "不得编造未提供的数据，不得给出绝对买卖指令，必须明确提示：仅供参考，不构成投资建议。"
+        "涉及事件数据时，必须区分数据已确认的事实、可能影响股价的催化剂、尚未验证的市场预期。"
     )
     user_prompt = f"""
     请基于以下结构化数据，生成 A 股股票 AI 投资分析报告，必须包含：
@@ -446,6 +709,7 @@ def call_deepseek(config: Config, structured_text: str) -> str:
     4. 风险提示
     5. 综合评分（0-100，并解释依据）
     6. 是否适合当前买入（只能使用审慎、观望、分批关注等非绝对表述）
+    7. 事件驱动分析：请明确分成“已确认事实”、“可能影响股价的催化剂”、“尚未验证的市场预期”三类；对新闻或行业政策摘要必须标注需要进一步验证。
 
     请使用中文，结构清晰，避免夸大收益。评价估值吸引力时，必须结合盈利质量
     （如净利润、ROE、毛利率、资产负债率）与估值分位，不要孤立评价 PE/PB。
@@ -502,7 +766,9 @@ def analyze_stock(raw_code: str) -> str:
     tech = calculate_technical_indicators(daily)
     valuation = get_daily_basic(pro, ts_code)
     financials = get_financial_data(pro, ts_code)
-    structured_text = build_structured_text(stock_basic, tech, financials, valuation)
+    events = get_recent_events(pro, ts_code)
+    events_summary = summarize_events(events)
+    structured_text = build_structured_text(stock_basic, tech, financials, valuation, events_summary)
 
     print("\n" + "-" * 72)
     print("已整理的数据摘要：")
