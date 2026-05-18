@@ -214,8 +214,89 @@ def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def _valid_price_levels(*levels: Any) -> list[float]:
+    """Return positive numeric levels, filtering out missing values."""
+    valid_levels = []
+    for level in levels:
+        if level is None or pd.isna(level):
+            continue
+        numeric_level = float(level)
+        if numeric_level > 0:
+            valid_levels.append(numeric_level)
+    return valid_levels
+
+
+def _estimate_risk_reward(row: pd.Series) -> pd.Series:
+    """Estimate risk/reward using nearest support below and resistance above price."""
+    current_price = row.get("close")
+    if current_price is None or pd.isna(current_price) or current_price <= 0:
+        return pd.Series(
+            {
+                "reference_support": pd.NA,
+                "reference_resistance": pd.NA,
+                "downside_to_support_pct": pd.NA,
+                "upside_to_resistance_pct": pd.NA,
+                "risk_reward_ratio": pd.NA,
+            }
+        )
+
+    current_price = float(current_price)
+    supports = _valid_price_levels(row.get("low_20d"), row.get("ma20"), row.get("ma60"))
+    resistances = _valid_price_levels(row.get("high_20d"), row.get("high_60d"))
+    support_candidates = [level for level in supports if level < current_price]
+    resistance_candidates = [level for level in resistances if level > current_price]
+    reference_support = max(support_candidates) if support_candidates else pd.NA
+    reference_resistance = min(resistance_candidates) if resistance_candidates else pd.NA
+
+    downside_pct = pd.NA
+    upside_pct = pd.NA
+    risk_reward_ratio = pd.NA
+    if not pd.isna(reference_support):
+        downside_pct = (current_price / float(reference_support) - 1) * 100
+    if not pd.isna(reference_resistance):
+        upside_pct = (float(reference_resistance) / current_price - 1) * 100
+    if not pd.isna(downside_pct) and downside_pct > 0 and not pd.isna(upside_pct):
+        risk_reward_ratio = upside_pct / downside_pct
+
+    return pd.Series(
+        {
+            "reference_support": reference_support,
+            "reference_resistance": reference_resistance,
+            "downside_to_support_pct": downside_pct,
+            "upside_to_resistance_pct": upside_pct,
+            "risk_reward_ratio": risk_reward_ratio,
+        }
+    )
+
+
+def calculate_trade_levels(tech: pd.DataFrame) -> pd.DataFrame:
+    """Add breakout, support/resistance, ATR, and risk/reward levels."""
+    df = tech.copy()
+    for window in (20, 60):
+        df[f"high_{window}d"] = df["high"].rolling(window=window).max()
+        df[f"low_{window}d"] = df["low"].rolling(window=window).min()
+        df[f"dist_to_{window}d_high_pct"] = (df["close"] / df[f"high_{window}d"] - 1) * 100
+        df[f"dist_to_{window}d_low_pct"] = (df["close"] / df[f"low_{window}d"] - 1) * 100
+
+    previous_close = df["close"].shift(1)
+    true_range = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - previous_close).abs(),
+            (df["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    df["true_range"] = true_range
+    df["atr20"] = true_range.rolling(window=20).mean()
+    df["atr20_pct"] = df["atr20"] / df["close"] * 100
+
+    risk_reward = df.apply(_estimate_risk_reward, axis=1)
+    return pd.concat([df, risk_reward], axis=1)
+
+
 def calculate_technical_indicators(daily: pd.DataFrame) -> pd.DataFrame:
-    print_step("计算技术指标：MA、RSI、MACD、成交量变化、近20日涨跌幅")
+    print_step("计算技术指标：MA、RSI、MACD、成交量变化、近20日涨跌幅、支撑压力与波动风险")
     df = daily.copy()
     for window in (5, 10, 20, 60):
         df[f"ma{window}"] = df["close"].rolling(window=window).mean()
@@ -228,6 +309,7 @@ def calculate_technical_indicators(daily: pd.DataFrame) -> pd.DataFrame:
     df["macd"] = 2 * (df["macd_dif"] - df["macd_dea"])
     df["volume_change_pct"] = df["vol"].pct_change() * 100
     df["return_20d_pct"] = (df["close"] / df["close"].shift(20) - 1) * 100
+    df = calculate_trade_levels(df)
     print_success("技术指标计算完成")
     return df
 
@@ -282,6 +364,25 @@ def build_structured_text(
     - 最新成交量变化：{safe_fmt(latest.get('volume_change_pct'), '%')}
     - 近20个交易日涨跌幅：{safe_fmt(latest.get('return_20d_pct'), '%')}
 
+    交易价位、波动风险与风报比：
+    - 近20日最高价：{safe_fmt(latest.get('high_20d'))}
+    - 近20日最低价：{safe_fmt(latest.get('low_20d'))}
+    - 近60日最高价：{safe_fmt(latest.get('high_60d'))}
+    - 近60日最低价：{safe_fmt(latest.get('low_60d'))}
+    - 收盘价距20日高点：{safe_fmt(latest.get('dist_to_20d_high_pct'), '%')}
+    - 收盘价距20日低点：{safe_fmt(latest.get('dist_to_20d_low_pct'), '%')}
+    - 收盘价距60日高点：{safe_fmt(latest.get('dist_to_60d_high_pct'), '%')}
+    - 收盘价距60日低点：{safe_fmt(latest.get('dist_to_60d_low_pct'), '%')}
+    - ATR20（近20日平均真实波幅）：{safe_fmt(latest.get('atr20'))}
+    - ATR20 / 收盘价：{safe_fmt(latest.get('atr20_pct'), '%')}
+    - 简单支撑位：近20日低点 {safe_fmt(latest.get('low_20d'))}；MA20 {safe_fmt(latest.get('ma20'))}；MA60 {safe_fmt(latest.get('ma60'))}
+    - 简单压力位：近20日高点 {safe_fmt(latest.get('high_20d'))}；近60日高点 {safe_fmt(latest.get('high_60d'))}
+    - 风报比参考支撑位：{safe_fmt(latest.get('reference_support'))}
+    - 风报比参考压力位：{safe_fmt(latest.get('reference_resistance'))}
+    - 距参考支撑的潜在下行空间：{safe_fmt(latest.get('downside_to_support_pct'), '%')}
+    - 距参考压力的潜在上行空间：{safe_fmt(latest.get('upside_to_resistance_pct'), '%')}
+    - 估算风险收益比（上行空间/下行空间）：{safe_fmt(latest.get('risk_reward_ratio'))}
+
     财务数据（最新可得报告）：
     - 报告期（利润表）：{income.get('end_date') if income is not None else '暂无数据'}
     - 营收：{safe_fmt(income.get('total_revenue') if income is not None else None, ' 元')}
@@ -318,7 +419,7 @@ def call_deepseek(config: Config, structured_text: str) -> str:
     )
     user_prompt = f"""
     请基于以下结构化数据，生成 A 股股票 AI 投资分析报告，必须包含：
-    1. 短期投资建议（3-5个交易日）
+    1. 短期投资建议（3-5个交易日）：必须明确写出触发条件、失效条件、参考支撑位、参考压力位、不适合追高的条件
     2. 中期投资建议（2-3个月）
     3. 长期投资建议（1年左右）
     4. 风险提示
