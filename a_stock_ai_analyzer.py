@@ -738,6 +738,7 @@ def build_structured_text(
     financials: dict[str, pd.Series | None],
     valuation: pd.DataFrame,
     events_summary: str,
+    external_news_analysis: str = "",
 ) -> str:
     print_step("整理结构化分析文本")
     latest = tech.iloc[-1]
@@ -806,6 +807,9 @@ def build_structured_text(
 
     近期事件与潜在催化剂：
     {events_summary}
+
+    DeepSeek资讯检索与分析（外部补充）：
+    {external_news_analysis or "未触发外部资讯检索补充。"}
 
     分析周期定义：
     - 短期：3-5个交易日
@@ -882,6 +886,57 @@ def call_deepseek(config: Config, structured_text: str) -> str:
     return content
 
 
+def call_deepseek_news_research(config: Config, ts_code: str, stock_name: str, industry: str) -> str:
+    """Use DeepSeek to perform focused news clue retrieval + analysis when Tushare news is unavailable."""
+    print_step("调用 DeepSeek 进行资讯检索与事件分析补充")
+    today = dt.datetime.now().strftime("%Y-%m-%d")
+    system_prompt = (
+        "你是A股资讯研究员。请围绕目标公司做资讯检索型总结与事件分析。"
+        "若无法确认具体事实，请明确标注“待核验”。禁止编造确定性事实。"
+    )
+    user_prompt = f"""
+    请针对以下标的输出“资讯检索与分析补充”：
+    - 股票代码：{ts_code}
+    - 公司名称：{stock_name or '未知'}
+    - 行业：{industry or '未知'}
+    - 当前日期：{today}
+
+    输出要求（必须按此结构）：
+    1) 近30天可能相关的重要资讯（3-6条）：每条包含【主题】【潜在影响】【核验状态(已核验/待核验)】。
+    2) 行业层面催化与风险（2-4条）：每条包含【逻辑】【对该股可能影响】。
+    3) 资金与情绪线索（2-3条）：如风格切换、题材热度、成交行为变化等。
+    4) 综合结论：给出短期/中期的“资讯面倾向”（偏多/中性/偏空）并说明依据。
+
+    注意：
+    - 优先给出可执行的检索结论，而不是泛泛建议。
+    - 凡是不确定的信息必须标注“待核验”。
+    - 使用中文，简洁清晰。
+    """
+    payload = {
+        "model": config.deepseek_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": textwrap.dedent(user_prompt).strip()},
+        ],
+        "temperature": 0.2,
+        "stream": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {config.deepseek_api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=90)
+        response.raise_for_status()
+        data = response.json()
+        content = data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        print_warning(f"DeepSeek资讯检索补充失败，已跳过：{exc}")
+        return "DeepSeek资讯检索补充失败，本次仅使用Tushare可得结构化数据。"
+    print_success("DeepSeek资讯检索补充完成")
+    return content
+
+
 def analyze_stock(raw_code: str) -> str:
     print("=" * 72)
     print("A股股票 AI 投资分析系统 - 第一版")
@@ -900,7 +955,22 @@ def analyze_stock(raw_code: str) -> str:
     financials = get_financial_data(pro, ts_code)
     events = get_recent_events(pro, ts_code)
     events_summary = summarize_events(events)
-    structured_text = build_structured_text(stock_basic, tech, financials, valuation, events_summary)
+    external_news_analysis = ""
+    if events is None or events.empty or "新闻摘要" not in events.get("event_type", pd.Series(dtype=str)).values:
+        external_news_analysis = call_deepseek_news_research(
+            config=config,
+            ts_code=ts_code,
+            stock_name=str(stock_basic.get("name") or "").strip(),
+            industry=str(stock_basic.get("industry") or "").strip(),
+        )
+    structured_text = build_structured_text(
+        stock_basic,
+        tech,
+        financials,
+        valuation,
+        events_summary,
+        external_news_analysis=external_news_analysis,
+    )
 
     print("\n" + "-" * 72)
     print("已整理的数据摘要：")
