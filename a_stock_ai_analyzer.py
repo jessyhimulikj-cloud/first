@@ -617,6 +617,80 @@ def calculate_valuation_metrics(valuation: pd.DataFrame) -> dict[str, Any]:
     return result
 
 
+def calculate_factor_scores(
+    tech: pd.DataFrame,
+    valuation_metrics: dict[str, Any],
+    financials: dict[str, pd.Series | None],
+) -> dict[str, Any]:
+    """Build a simple, explainable factor scorecard for LLM grounding."""
+    print_step("计算多因子评分：趋势、估值、质量、风险")
+    latest = tech.iloc[-1]
+    score_details: dict[str, dict[str, Any]] = {}
+
+    # Trend (0-100)
+    trend_score = 50.0
+    if _safe_number(latest.get("ma5")) and _safe_number(latest.get("ma20")):
+        trend_score += 15 if latest.get("ma5") > latest.get("ma20") else -15
+    if _safe_number(latest.get("close")) and _safe_number(latest.get("ma20")):
+        trend_score += 10 if latest.get("close") > latest.get("ma20") else -10
+    rsi = _safe_number(latest.get("rsi14"))
+    if rsi is not None:
+        if 40 <= rsi <= 65:
+            trend_score += 10
+        elif rsi > 80 or rsi < 20:
+            trend_score -= 10
+    trend_score = float(max(0, min(100, trend_score)))
+    score_details["trend"] = {"score": trend_score, "reason": "MA相对位置 + RSI区间"}
+
+    # Valuation (0-100)
+    label_to_score = {"估值偏低": 80.0, "合理": 60.0, "偏高": 35.0, "极端": 20.0}
+    pe_label = valuation_metrics.get("pe", {}).get("label", "极端")
+    pb_label = valuation_metrics.get("pb", {}).get("label", "极端")
+    valuation_score = (label_to_score.get(pe_label, 20.0) + label_to_score.get(pb_label, 20.0)) / 2
+    score_details["valuation"] = {"score": valuation_score, "reason": f"PE标签={pe_label}, PB标签={pb_label}"}
+
+    # Quality (0-100)
+    indicator = financials.get("indicator")
+    balance = financials.get("balancesheet")
+    quality_score = 50.0
+    roe = _safe_number(indicator.get("roe")) if indicator is not None else None
+    gpm = _safe_number(indicator.get("grossprofit_margin")) if indicator is not None else None
+    debt_ratio = None
+    if balance is not None and _safe_number(balance.get("total_assets")) and _safe_number(balance.get("total_liab")):
+        debt_ratio = float(balance.get("total_liab") / balance.get("total_assets") * 100)
+    if roe is not None:
+        quality_score += 20 if roe >= 12 else (8 if roe >= 8 else -10)
+    if gpm is not None:
+        quality_score += 10 if gpm >= 20 else (-8 if gpm < 10 else 0)
+    if debt_ratio is not None:
+        quality_score += 8 if debt_ratio <= 50 else (-10 if debt_ratio >= 70 else 0)
+    quality_score = float(max(0, min(100, quality_score)))
+    score_details["quality"] = {"score": quality_score, "reason": "ROE + 毛利率 + 资产负债率"}
+
+    # Risk (higher means safer)
+    risk_score = 50.0
+    ret20 = _safe_number(latest.get("return_20d_pct"))
+    vol_chg = _safe_number(latest.get("volume_change_pct"))
+    if ret20 is not None and abs(ret20) >= 20:
+        risk_score -= 10
+    if vol_chg is not None and abs(vol_chg) >= 80:
+        risk_score -= 10
+    if debt_ratio is not None and debt_ratio >= 70:
+        risk_score -= 10
+    risk_score = float(max(0, min(100, risk_score)))
+    score_details["risk"] = {"score": risk_score, "reason": "波动 + 成交量异动 + 杠杆水平"}
+
+    composite = round(
+        score_details["trend"]["score"] * 0.30
+        + score_details["valuation"]["score"] * 0.25
+        + score_details["quality"]["score"] * 0.25
+        + score_details["risk"]["score"] * 0.20,
+        1,
+    )
+    print_success(f"多因子评分计算完成，综合分 {composite}")
+    return {"details": score_details, "composite": composite}
+
+
 def build_structured_text(
     stock_basic: pd.Series,
     tech: pd.DataFrame,
@@ -629,6 +703,7 @@ def build_structured_text(
     previous = tech.iloc[-2] if len(tech) >= 2 else latest
     latest_val = valuation.iloc[-1]
     valuation_metrics = calculate_valuation_metrics(valuation)
+    factor_scores = calculate_factor_scores(tech, valuation_metrics, financials)
     income = financials.get("income")
     indicator = financials.get("indicator")
     balance = financials.get("balancesheet")
@@ -681,6 +756,13 @@ def build_structured_text(
     - 换手率：{safe_fmt(latest_val.get('turnover_rate'), '%')}
     - 量比：{safe_fmt(latest_val.get('volume_ratio'))}
 
+    多因子打分（用于约束AI输出，不可忽略反证）：
+    - 趋势因子得分：{safe_fmt(factor_scores['details']['trend']['score'])}；依据：{factor_scores['details']['trend']['reason']}
+    - 估值因子得分：{safe_fmt(factor_scores['details']['valuation']['score'])}；依据：{factor_scores['details']['valuation']['reason']}
+    - 质量因子得分：{safe_fmt(factor_scores['details']['quality']['score'])}；依据：{factor_scores['details']['quality']['reason']}
+    - 风险因子得分：{safe_fmt(factor_scores['details']['risk']['score'])}；依据：{factor_scores['details']['risk']['reason']}
+    - 综合因子评分（0-100）：{safe_fmt(factor_scores['composite'])}
+
     近期事件与潜在催化剂：
     {events_summary}
 
@@ -702,17 +784,25 @@ def call_deepseek(config: Config, structured_text: str) -> str:
         "涉及事件数据时，必须区分数据已确认的事实、可能影响股价的催化剂、尚未验证的市场预期。"
     )
     user_prompt = f"""
-    请基于以下结构化数据，生成 A 股股票 AI 投资分析报告，必须包含：
-    1. 短期投资建议（3-5个交易日）
-    2. 中期投资建议（2-3个月）
-    3. 长期投资建议（1年左右）
-    4. 风险提示
-    5. 综合评分（0-100，并解释依据）
+    请基于以下结构化数据，生成 A 股股票 AI 投资分析报告。
+    你必须严格执行“先证据、后结论”，并采用多角色审议格式：
+    - 角色A（基本面研究员）
+    - 角色B（技术面研究员）
+    - 角色C（风控官）
+    - 角色D（投委会秘书，汇总）
+
+    必须包含以下内容：
+    1. 三个角色各自的“核心观点+证据+反证”
+    2. 短期/中期/长期建议（3-5日、2-3月、1年）
+    3. 可执行计划：建议仓位（轻仓/标准仓/重仓）、入场区间、止损、止盈、失效条件
+    4. 风险提示（至少3条）
+    5. 综合评分（0-100，并解释依据；要引用输入中的多因子分项得分）
     6. 是否适合当前买入（只能使用审慎、观望、分批关注等非绝对表述）
-    7. 事件驱动分析：请明确分成“已确认事实”、“可能影响股价的催化剂”、“尚未验证的市场预期”三类；对新闻或行业政策摘要必须标注需要进一步验证。
+    7. 事件驱动分析：请明确分成“已确认事实”“可能影响股价的催化剂”“尚未验证的市场预期”三类
 
     请使用中文，结构清晰，避免夸大收益。评价估值吸引力时，必须结合盈利质量
     （如净利润、ROE、毛利率、资产负债率）与估值分位，不要孤立评价 PE/PB。
+    若证据不足，请明确写“证据不足，建议观望或仅跟踪”。
     最后再次注明“{DISCLAIMER}”。
 
     数据如下：
