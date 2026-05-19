@@ -253,6 +253,42 @@ def call_optional_tushare(func: Any, friendly_name: str, **kwargs: Any) -> pd.Da
     return df
 
 
+def fetch_top_list_events(pro: ts.pro_api, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch top list events with per-trade-date queries (top_list requires trade_date)."""
+    print_step("尝试获取龙虎榜（按交易日逐日检索）")
+    try:
+        daily_dates = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date, fields="trade_date")
+    except Exception as exc:
+        print_warning(f"龙虎榜交易日获取失败，已跳过：{exc}")
+        return pd.DataFrame()
+
+    if daily_dates is None or daily_dates.empty or "trade_date" not in daily_dates.columns:
+        print_warning("龙虎榜交易日为空，已跳过")
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    trade_dates = (
+        daily_dates["trade_date"].dropna().astype(str).sort_values(ascending=False).head(30).tolist()
+    )
+    for trade_date in trade_dates:
+        day_df = call_optional_tushare(
+            pro.top_list,
+            "龙虎榜",
+            trade_date=trade_date,
+            ts_code=ts_code,
+            fields="trade_date,ts_code,name,close,pct_change,turnover_rate,amount,l_sell,l_buy,l_amount,net_amount,net_rate,amount_rate,float_values,reason",
+        )
+        if not day_df.empty:
+            frames.append(day_df)
+
+    if not frames:
+        print_warning("龙虎榜在最近交易日未命中该股票记录或权限不可用")
+        return pd.DataFrame()
+    merged = pd.concat(frames, ignore_index=True, sort=False).drop_duplicates()
+    print_success(f"龙虎榜整理完成，共 {len(merged)} 条记录")
+    return merged
+
+
 def get_recent_events(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
     """Fetch recent stock events from available Tushare Pro endpoints.
 
@@ -308,7 +344,7 @@ def get_recent_events(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
             },
         },
         {
-            "func_name": "anns",
+            "func_name_candidates": ("anns_d", "anns"),
             "friendly_name": "重大公告",
             "event_type": "重大公告",
             "date_columns": ("ann_date",),
@@ -344,18 +380,6 @@ def get_recent_events(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
             },
         },
         {
-            "func_name": "top_list",
-            "friendly_name": "龙虎榜",
-            "event_type": "龙虎榜",
-            "date_columns": ("trade_date",),
-            "kwargs": {
-                "ts_code": ts_code,
-                "start_date": start_date,
-                "end_date": end_date,
-                "fields": "trade_date,ts_code,name,close,pct_change,turnover_rate,amount,l_sell,l_buy,l_amount,net_amount,net_rate,amount_rate,float_values,reason",
-            },
-        },
-        {
             "func_name": "stk_holdertrade",
             "friendly_name": "股东增减持",
             "event_type": "股东增减持",
@@ -383,7 +407,14 @@ def get_recent_events(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
     ]
 
     for request in event_requests:
-        func = getattr(pro, request["func_name"], None)
+        func = None
+        if "func_name_candidates" in request:
+            for candidate in request["func_name_candidates"]:
+                func = getattr(pro, candidate, None)
+                if func is not None:
+                    break
+        else:
+            func = getattr(pro, request["func_name"], None)
         if func is None:
             print_warning(f"Tushare 当前客户端不支持{request['friendly_name']}接口，已跳过")
             continue
@@ -410,6 +441,12 @@ def get_recent_events(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
         if not normalized.empty:
             frames.append(normalized)
 
+    top_list_df = fetch_top_list_events(pro, ts_code, start_date, end_date)
+    if not top_list_df.empty:
+        normalized_top = normalize_event_frame(top_list_df, "龙虎榜", ("trade_date",))
+        if not normalized_top.empty:
+            frames.append(normalized_top)
+
     if not frames:
         print_warning("最近 90 天事件数据为空或当前 Tushare 权限不可用")
         return pd.DataFrame()
@@ -424,7 +461,11 @@ def get_recent_events(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
 def summarize_events(events_df: pd.DataFrame) -> str:
     """Summarize normalized recent events for the model prompt."""
     if events_df is None or events_df.empty:
-        return "最近 90 天未获取到可用事件数据；可能是无相关事件、接口权限不足或数据源暂不可用。"
+        return (
+            "最近 90 天未获取到可用事件数据；可能是无相关事件、接口权限不足或数据源暂不可用。"
+            "请在最终报告中单独输出“待验证资讯线索”小节：基于公司与行业背景给出 3-5 条需要人工核验的新闻关键词/方向，"
+            "并明确标注为“非事实数据、仅用于信息检索”。"
+        )
 
     def pick(row: pd.Series, columns: tuple[str, ...]) -> str:
         parts = []
@@ -799,6 +840,7 @@ def call_deepseek(config: Config, structured_text: str) -> str:
     5. 综合评分（0-100，并解释依据；要引用输入中的多因子分项得分）
     6. 是否适合当前买入（只能使用审慎、观望、分批关注等非绝对表述）
     7. 事件驱动分析：请明确分成“已确认事实”“可能影响股价的催化剂”“尚未验证的市场预期”三类
+    8. 若输入中明确提示事件/新闻缺失，请新增“待验证资讯线索”小节，给出3-5条检索关键词（公司层面+行业层面），并注明这些线索不是事实陈述。
 
     请使用中文，结构清晰，避免夸大收益。评价估值吸引力时，必须结合盈利质量
     （如净利润、ROE、毛利率、资产负债率）与估值分位，不要孤立评价 PE/PB。
