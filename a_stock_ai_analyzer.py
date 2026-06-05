@@ -253,42 +253,6 @@ def call_optional_tushare(func: Any, friendly_name: str, **kwargs: Any) -> pd.Da
     return df
 
 
-def fetch_top_list_events(pro: ts.pro_api, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """Fetch top list events with per-trade-date queries (top_list requires trade_date)."""
-    print_step("尝试获取龙虎榜（按交易日逐日检索）")
-    try:
-        daily_dates = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date, fields="trade_date")
-    except Exception as exc:
-        print_warning(f"龙虎榜交易日获取失败，已跳过：{exc}")
-        return pd.DataFrame()
-
-    if daily_dates is None or daily_dates.empty or "trade_date" not in daily_dates.columns:
-        print_warning("龙虎榜交易日为空，已跳过")
-        return pd.DataFrame()
-
-    frames: list[pd.DataFrame] = []
-    trade_dates = (
-        daily_dates["trade_date"].dropna().astype(str).sort_values(ascending=False).head(30).tolist()
-    )
-    for trade_date in trade_dates:
-        day_df = call_optional_tushare(
-            pro.top_list,
-            "龙虎榜",
-            trade_date=trade_date,
-            ts_code=ts_code,
-            fields="trade_date,ts_code,name,close,pct_change,turnover_rate,amount,l_sell,l_buy,l_amount,net_amount,net_rate,amount_rate,float_values,reason",
-        )
-        if not day_df.empty:
-            frames.append(day_df)
-
-    if not frames:
-        print_warning("龙虎榜在最近交易日未命中该股票记录或权限不可用")
-        return pd.DataFrame()
-    merged = pd.concat(frames, ignore_index=True, sort=False).drop_duplicates()
-    print_success(f"龙虎榜整理完成，共 {len(merged)} 条记录")
-    return merged
-
-
 def get_recent_events(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
     """Fetch recent stock events from available Tushare Pro endpoints.
 
@@ -441,11 +405,6 @@ def get_recent_events(pro: ts.pro_api, ts_code: str) -> pd.DataFrame:
         if not normalized.empty:
             frames.append(normalized)
 
-    top_list_df = fetch_top_list_events(pro, ts_code, start_date, end_date)
-    if not top_list_df.empty:
-        normalized_top = normalize_event_frame(top_list_df, "龙虎榜", ("trade_date",))
-        if not normalized_top.empty:
-            frames.append(normalized_top)
 
     if not frames:
         print_warning("最近 90 天事件数据为空或当前 Tushare 权限不可用")
@@ -482,13 +441,12 @@ def summarize_events(events_df: pd.DataFrame) -> str:
         "重大公告": ("title", "url"),
         "分红送转": ("div_proc", "stk_div", "stk_bo_rate", "stk_co_rate", "cash_div", "cash_div_tax", "record_date", "ex_date", "pay_date"),
         "限售股解禁": ("float_date", "float_share", "float_ratio", "holder_name", "share_type"),
-        "龙虎榜": ("close", "pct_change", "turnover_rate", "amount", "net_amount", "reason"),
         "股东增减持": ("holder_name", "holder_type", "in_de", "change_vol", "change_ratio", "avg_price", "begin_date", "close_date"),
         "新闻摘要": ("datetime", "title", "content", "channels"),
     }
 
     lines = ["最近 90 天事件数据（来自当前 Tushare 权限可获取接口；新闻为未验证线索，需交叉验证）："]
-    preferred_order = ["业绩预告", "业绩快报", "重大公告", "分红送转", "限售股解禁", "龙虎榜", "股东增减持", "新闻摘要"]
+    preferred_order = ["业绩预告", "业绩快报", "重大公告", "分红送转", "限售股解禁", "股东增减持", "新闻摘要"]
     for event_type in preferred_order:
         group = events_df[events_df["event_type"] == event_type]
         if group.empty:
@@ -821,36 +779,34 @@ def build_structured_text(
 
 
 def call_deepseek(config: Config, structured_text: str) -> str:
-    print_step("调用 DeepSeek API 生成深度分析报告")
+    print_step("调用 DeepSeek API 生成困境反转投研备忘录")
     system_prompt = (
-        "你是严谨的A股研究助理，擅长困境反转型价值投资分析。请基于用户提供的数据生成分析报告，"
-        "不得编造未提供的数据，不得给出绝对买卖指令，必须明确提示：仅供参考，不构成投资建议。"
-        "涉及事件数据时，必须区分数据已确认的事实、可能影响股价的催化剂、尚未验证的市场预期。"
+        "你是严谨的A股困境反转研究助理，分析框架以产业催化能否穿透财务报表为核心。"
+        "产业催化优先级高于短线情绪，财务拐点用于验证催化是否落地，估值只作为安全边际，"
+        "不得因低估值或单一催化直接得出积极结论。不得编造未提供的数据，不得给出绝对买卖指令，"
+        "必须明确提示：仅供参考，不构成投资建议。"
     )
     user_prompt = f"""
-    请基于以下结构化数据，生成 A 股股票 AI 投资分析报告。
-    你必须严格执行“先证据、后结论”，并采用多角色审议格式：
-    - 角色A（基本面研究员）
-    - 角色B（技术面研究员）
-    - 角色C（风控官）
-    - 角色D（投委会秘书，汇总）
+    请基于以下结构化数据，生成一份中文“困境反转投研备忘录”，而不是冗长审议报告。
 
-    必须包含以下内容：
-    1. 三个角色各自的“核心观点+证据+反证”
-    2. 中线波段/长线建议（2-6个月、1-2年）
-    3. 可执行计划：建议仓位（轻仓/标准仓/重仓）、入场区间、止损、止盈、失效条件
-    4. 风险提示（至少3条）
-    5. 综合评分（0-100，并解释依据；要引用输入中的多因子分项得分）
-    6. 是否适合当前买入（只能使用审慎、观望、分批关注等非绝对表述）
-    7. 事件驱动分析：请明确分成“已确认事实”“可能影响股价的催化剂”“尚未验证的市场预期”三类
-    8. 若输入中明确提示事件/新闻缺失，请新增“待验证资讯线索”小节，给出3-5条检索关键词（公司层面+行业层面），并注明这些线索不是事实陈述。
-    9. 必须加入“困境反转框架”小节：说明当前处于“困境加深/困境筑底/修复早期/修复确认”哪一阶段，并给出2-4条判据。
+    输出必须满足：
+    - 全文约 1200-1800 字；每个小节优先用要点式表达，避免空泛套话。
+    - 严格先证据、后结论；所有关键判断都要引用输入数据，若缺失则明确写“证据缺失/证据不足”。
+    - 必须降低技术面权重，不要写成短线择时报告；严禁使用“明日”“本周”“短线买入”等表达。
+    - 禁止“低估值所以值得买”“有催化所以看好”等单因子结论。
+    - 必须明确输出“最强证据”和“最大反证”，让结论可被验证。
 
-    请使用中文，结构清晰，避免夸大收益。评价估值吸引力时，必须结合盈利质量
-    （如净利润、ROE、毛利率、资产负债率）与估值分位，不要孤立评价 PE/PB。
-    若证据不足，请明确写“证据不足，建议观望或仅跟踪”。
-    严禁输出短线（如3-5个交易日）建议，不要使用“明日/本周”级别择时表达。
-    最后再次注明“{DISCLAIMER}”。
+    请固定使用以下结构：
+    1. 一句话结论：写明反转阶段 + 当前态度 + 最关键理由。当前态度只能使用“观望 / 跟踪 / 分批关注 / 谨慎提高关注度”等非绝对表达。
+    2. 反转阶段判定：只能在“困境加深 / 困境筑底 / 修复早期 / 修复确认”中选择一个；列出 2-4 条判据，并标注“最强证据”和“最大反证”。
+    3. 产业催化：分为“已确认催化”“待验证催化”“催化失效条件”。产业催化必须优先于资金热度，且不能把未验证新闻写成事实。
+    4. 财务与估值证据：围绕盈利质量、负债压力、PE/PB 分位是否支持反转；估值只能作为安全边际，不能单独构成关注理由。
+    5. 反证与风险：至少 3 条，必须具体引用输入数据或说明证据缺失，不得只写宏观波动等泛化风险。
+    6. 跟踪清单：列出 3-5 个后续观察指标，覆盖产业催化兑现、财务拐点、负债/现金流、估值安全边际、反证变化。
+    7. 操作倾向：仅使用“观望 / 跟踪 / 分批关注 / 谨慎提高关注度”等非绝对表达；写清楚触发提高关注度与降低关注度的条件，不给具体短线买卖点。
+    8. 若输入中明确提示事件/新闻缺失，请新增“待验证资讯线索”小节，给出 3-5 条检索关键词（公司层面+行业层面），并注明这些线索不是事实陈述。
+
+    最后必须再次注明“{DISCLAIMER}”。
 
     数据如下：
     {structured_text}
@@ -1003,7 +959,7 @@ def main() -> int:
         return 130
 
     print("\n" + "=" * 72)
-    print("AI 深度分析报告")
+    print("困境反转投研备忘录")
     print("=" * 72)
     print(report)
     print("=" * 72)
